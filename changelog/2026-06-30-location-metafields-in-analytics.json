@@ -1,0 +1,7 @@
+{
+  "title": "Use location metafields as dimensions and filters in Analytics",
+  "date": "2026-06-30",
+  "description": "You can now enable analytics querying on location metafield definitions and use them as dimensions and filters in Vaulty Analytics reports.",
+  "type": "Improvement",
+  "tags": ["Analytics", "Inventory"]
+}

@@ -1,0 +1,7 @@
+{
+  "title": "Filter and group your reports by physical storefront",
+  "date": "2026-06-30",
+  "description": "Use the new \"Is_physical_storefront dimension\" to filter and group your reports by physical retail locations in Reports and Explore so you can analyze in-store sales.",
+  "type": "Feature",
+  "tags": ["Analytics", "Storefronts"]
+}

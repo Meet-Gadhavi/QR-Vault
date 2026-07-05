@@ -1,0 +1,7 @@
+{
+  "title": "Define and manage metafields on inventory transfers",
+  "date": "2026-06-30",
+  "description": "Attach custom metafields to inventory transfers. Store lot numbers, supplier codes, freight details, or ERP reference data directly on transfers in the admin and API.",
+  "type": "Improvement",
+  "tags": ["Inventory", "Admin"]
+}

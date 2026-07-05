@@ -1,0 +1,7 @@
+{
+  "title": "Brazil CNPJ validation now supports alphanumeric identifiers",
+  "date": "2026-07-01",
+  "description": "We've updated Brazil CNPJ validation to support Receita Federal's new alphanumeric CNPJ format.",
+  "type": "Improvement",
+  "tags": ["Checkout", "Validation"]
+}

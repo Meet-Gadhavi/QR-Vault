@@ -1,0 +1,7 @@
+{
+  "title": "Full-page stepper creator for QR Vaults",
+  "date": "2026-07-04",
+  "description": "We have replaced the pop-up modal for QR and Vault creation with a dedicated full-page wizard. It guides you step-by-step through configuration with automatic progress tracking.",
+  "type": "Feature",
+  "tags": ["Dashboard", "Creation Flow"]
+}

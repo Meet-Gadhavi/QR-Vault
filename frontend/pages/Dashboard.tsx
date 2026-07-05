@@ -1,0 +1,3848 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { mockService } from '../services/mockService';
+import { supabase } from '../services/supabaseClient';
+import { Vault, User, PlanType, VaultFile, FileType, PLAN_LIMITS, AccessLevel, AccessRequest, RequestStatus, Invoice, VaultType, ReceivingConfig } from '../types';
+import { PieChart, Pie, Cell, ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, BarChart, Bar, Legend } from 'recharts';
+import QRCode from 'react-qr-code';
+import { UploadCloud, File as FileIcon, Link as LinkIcon, Trash2, ExternalLink, Plus, X, Loader2, Eye, HardDrive, QrCode, Copy, Check, MoreVertical, Edit2, Search, Filter, ArrowUpDown, Download, Zap, ChevronDown, Lock, Users, Shield, UserCheck, UserX, Clock, ShieldCheck, AlertTriangle, AlertCircle, RotateCcw, FileText, Shuffle, Settings, Calendar, Share2, Box, Settings2, ChevronRight, TrendingUp, ArrowUp, Globe, Grid, Inbox, Send, Info, ArrowLeft } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
+import { useTheme } from '../contexts/ThemeContext';
+
+import { VaultModals } from '../components/VaultModals';
+import { ReceivingConfigBuilder } from '../components/Submissions/ReceivingConfigBuilder';
+import { SubmissionManager } from '../components/Submissions/SubmissionManager';
+import { toast } from 'sonner';
+
+// Modular Components
+import { StatGrid } from '../components/Dashboard/StatGrid';
+import { VaultCard } from '../components/Dashboard/VaultCard';
+import { AnalyticsPanel } from '../components/Dashboard/AnalyticsPanel';
+import { DashboardSkeleton } from '../components/SkeletonLoaders';
+import { CancelSubscriptionModal } from '../components/CancelSubscriptionModal';
+
+type SortOption = 'date-newest' | 'date-oldest' | 'name-asc' | 'name-desc' | 'size-desc' | 'size-asc';
+type FilterTime = 'all' | '10-days' | '30-days';
+
+const DEFAULT_RECEIVING_CONFIG: ReceivingConfig = {
+  allowedFileTypes: ['pdf', 'zip'],
+  maxFiles: 5,
+  minFiles: 1,
+  formFields: [
+    { label: 'Full Name', type: 'text', required: true },
+    { label: 'Email', type: 'email', required: true }
+  ],
+  fileRequests: [
+    { label: 'Upload document', fileType: 'PDF', required: true }
+  ],
+  thankYouMessage: 'Thank you for your submission!'
+};
+
+const generateTrendData = (vaultId: string, level: 'high' | 'medium' | 'low') => {
+  const seed = vaultId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  const data = [];
+  const baseValue = level === 'high' ? 60 : level === 'medium' ? 35 : 15;
+  for (let i = 0; i < 10; i++) {
+    const variance = Math.sin(seed + i * 0.8) * 25;
+    data.push({ value: Math.max(5, baseValue + variance + (i * 2)) });
+  }
+  return data;
+};
+
+const GoogleDriveImg = ({ className }: { className?: string }) => (
+  <img src="/GD.png" alt="Google Drive" className={className} />
+);
+
+type DeletedVaultLog = {
+  id: string;
+  vault_name: string;
+  created_at: string;
+  deleted_at: string;
+  views?: number;
+  deletion_reason?: string;
+};
+
+const VaultTimer: React.FC<{
+  createdAt: string;
+  expiresAt?: string;
+  views: number;
+  maxViews?: number;
+  lockedUntil?: string;
+}> = ({ createdAt, expiresAt, views, maxViews, lockedUntil }) => {
+  const [timeLeft, setTimeLeft] = useState<string>('');
+
+  useEffect(() => {
+    const calculateTime = () => {
+      let expires: number;
+      if (expiresAt) {
+        expires = new Date(expiresAt).getTime();
+      } else {
+        // Fallback for legacy vaults
+        expires = new Date(createdAt).getTime() + 24 * 60 * 60 * 1000;
+      }
+      const now = new Date().getTime();
+      const diff = expires - now;
+
+      if (diff <= 0) {
+        setTimeLeft('Expired');
+        return;
+      }
+
+      const h = Math.floor(diff / (1000 * 60 * 60));
+      const m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+      const s = Math.floor((diff % (1000 * 60)) / 1000);
+
+      setTimeLeft(`${h}h ${m}m ${s}s`);
+    };
+
+    calculateTime();
+    const timer = setInterval(calculateTime, 1000);
+    return () => clearInterval(timer);
+  }, [createdAt, expiresAt]);
+
+  const isLocked = lockedUntil && new Date(lockedUntil) > new Date();
+
+  if (isLocked) return (
+    <div className="bg-red-600 py-2.5 px-4 flex items-center justify-between text-white font-black uppercase text-xs tracking-widest animate-pulse border-t border-red-700">
+      <div className="flex items-center gap-2">
+        <ShieldCheck className="w-4 h-4" />
+        <span>Vault Locked</span>
+      </div>
+      <div className="flex items-center gap-2 opacity-80">
+        <Clock className="w-3 h-3" />
+        <span>Expires: {new Date(lockedUntil!).toLocaleDateString()}</span>
+      </div>
+    </div>
+  );
+
+  if (timeLeft === 'Expired') return (
+    <div className="bg-red-50 dark:bg-red-900/10 py-2 px-4 border-t border-red-100 dark:border-red-900/30 flex items-center justify-center gap-2">
+      <AlertCircle className="w-3.5 h-3.5 text-red-500" />
+      <span className="text-red-600 dark:text-red-400 font-bold text-xs uppercase tracking-wider">Vault Expired</span>
+    </div>
+  );
+
+  if (!expiresAt) return (
+    <div className="bg-primary-50/60 dark:bg-primary-900/10 py-2.5 px-4 border-t border-primary-100/50 dark:border-primary-900/30 flex items-center justify-center gap-2 group/timer transition-colors hover:bg-primary-50 dark:hover:bg-primary-900/20">
+      <ShieldCheck className="w-3.5 h-3.5 text-primary-500 group-hover/timer:scale-110 transition-transform" />
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-primary-700 dark:text-primary-400 font-black uppercase tracking-widest">Permanent Store</span>
+        <span className="text-xs font-black text-primary-600 dark:text-primary-500 uppercase tracking-tighter bg-primary-100 dark:bg-primary-900/50 px-1.5 py-0.5 rounded">Unlimited</span>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="bg-amber-50/60 dark:bg-amber-900/10 py-2.5 px-4 border-t border-amber-100/50 dark:border-amber-900/30 flex items-center justify-center gap-2 group/timer transition-colors hover:bg-amber-50 dark:hover:bg-amber-900/20">
+      <Clock className="w-3.5 h-3.5 text-amber-500 group-hover/timer:animate-spin-slow" />
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-amber-700 dark:text-amber-400 font-bold uppercase tracking-widest">Valid for:</span>
+        <span className="text-sm font-mono font-bold text-amber-600 dark:text-amber-500 tabular-nums">{timeLeft}</span>
+      </div>
+
+    </div>
+  );
+};
+
+const generateScanLogs = (vault: Vault, start: Date, end: Date) => {
+  const logs = [];
+  const count = vault.views;
+  
+  const osList = ['Windows', 'iOS', 'Android', 'macOS', 'Linux'];
+  const osWeights = [0.5, 0.3, 0.15, 0.04, 0.01];
+  
+  const countryList = ['India', 'United States', 'United Kingdom', 'Germany', 'Canada'];
+  const countryWeights = [0.6, 0.2, 0.1, 0.07, 0.03];
+  
+  const cityList = {
+    'India': ['Karjan', 'Mumbai', 'Delhi', 'Bangalore'],
+    'United States': ['New York', 'San Francisco', 'Chicago', 'Los Angeles'],
+    'United Kingdom': ['London', 'Manchester', 'Birmingham'],
+    'Germany': ['Berlin', 'Munich', 'Frankfurt'],
+    'Canada': ['Toronto', 'Vancouver', 'Montreal']
+  } as Record<string, string[]>;
+  
+  const getWeightedItem = <T,>(items: T[], weights: number[]): T => {
+    const r = Math.random();
+    let sum = 0;
+    for (let i = 0; i < items.length; i++) {
+      sum += weights[i];
+      if (r <= sum) return items[i];
+    }
+    return items[items.length - 1];
+  };
+
+  const startTime = start.getTime();
+  const endTime = end.getTime();
+  const timeDiff = Math.max(endTime - startTime, 1);
+
+  for (let i = 0; i < count; i++) {
+    const randomTime = new Date(startTime + Math.random() * timeDiff);
+    const os = getWeightedItem(osList, osWeights);
+    const country = getWeightedItem(countryList, countryWeights);
+    const cities = cityList[country] || ['Other'];
+    const city = cities[Math.floor(Math.random() * cities.length)];
+    const isUnique = Math.random() < 0.7;
+    const ip = `192.168.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
+    
+    logs.push({
+      timestamp: randomTime,
+      os,
+      country,
+      city,
+      unique: isUnique,
+      ip
+    });
+  }
+
+  logs.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+  return logs;
+};
+
+const getOverTimeData = (logs: any[], start: Date, end: Date, interval: 'Hour' | 'Day' | 'Week') => {
+  const groups: Record<string, { unique: number; nonUnique: number; timeVal: number }> = {};
+  
+  if (interval === 'Hour') {
+    const formatHour = (d: Date) => {
+      const hours = d.getHours();
+      const bin = Math.floor(hours / 4) * 4;
+      const pad = (n: number) => n.toString().padStart(2, '0');
+      return `${d.getDate()} ${d.toLocaleString('default', { month: 'short' })} ${pad(bin)}:00`;
+    };
+    
+    let current = new Date(start);
+    current.setHours(0, 0, 0, 0);
+    while (current <= end) {
+      for (let h = 0; h < 24; h += 4) {
+        const binDate = new Date(current);
+        binDate.setHours(h, 0, 0, 0);
+        const label = formatHour(binDate);
+        groups[label] = { unique: 0, nonUnique: 0, timeVal: binDate.getTime() };
+      }
+      current.setDate(current.getDate() + 1);
+    }
+    
+    logs.forEach(log => {
+      const label = formatHour(log.timestamp);
+      if (groups[label]) {
+        if (log.unique) groups[label].unique++;
+        else groups[label].nonUnique++;
+      }
+    });
+  } else if (interval === 'Day') {
+    const formatDay = (d: Date) => {
+      return `${d.getDate()} ${d.toLocaleString('default', { month: 'short' })}`;
+    };
+    
+    let current = new Date(start);
+    current.setHours(0, 0, 0, 0);
+    while (current <= end) {
+      const label = formatDay(current);
+      groups[label] = { unique: 0, nonUnique: 0, timeVal: current.getTime() };
+      current.setDate(current.getDate() + 1);
+    }
+    
+    logs.forEach(log => {
+      const label = formatDay(log.timestamp);
+      if (groups[label]) {
+        if (log.unique) groups[label].unique++;
+        else groups[label].nonUnique++;
+      }
+    });
+  } else {
+    const formatWeek = (d: Date) => {
+      const startOfWeek = new Date(d);
+      const day = startOfWeek.getDay();
+      const diff = startOfWeek.getDate() - day + (day === 0 ? -6 : 1);
+      startOfWeek.setDate(diff);
+      return `Wk of ${startOfWeek.getDate()} ${startOfWeek.toLocaleString('default', { month: 'short' })}`;
+    };
+    
+    let current = new Date(start);
+    current.setHours(0, 0, 0, 0);
+    while (current <= end) {
+      const label = formatWeek(current);
+      if (!groups[label]) {
+        groups[label] = { unique: 0, nonUnique: 0, timeVal: current.getTime() };
+      }
+      current.setDate(current.getDate() + 7);
+    }
+    
+    logs.forEach(log => {
+      const label = formatWeek(log.timestamp);
+      if (groups[label]) {
+        if (log.unique) groups[label].unique++;
+        else groups[label].nonUnique++;
+      }
+    });
+  }
+
+  return Object.entries(groups)
+    .map(([label, val]) => ({ name: label, Unique: val.unique, 'Non-Unique': val.nonUnique, timeVal: val.timeVal }))
+    .sort((a, b) => a.timeVal - b.timeVal);
+};
+
+export const Dashboard: React.FC = () => {
+  const navigate = useNavigate();
+  const { isAuthenticated, userEmail, userId } = useAuth();
+
+  const [appUser, setAppUser] = useState<User | null>(null);
+  const [vaults, setVaults] = useState<Vault[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [timeLeft, setTimeLeft] = useState('');
+
+  // Search & Filter State
+  const [searchTerm, setSearchTerm] = useState('');
+  const [sortOption, setSortOption] = useState<SortOption>('date-newest');
+  const [filterTime, setFilterTime] = useState<FilterTime>('all');
+
+  // Modal State (Create & Edit)
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [modalMode, setModalMode] = useState<'CREATE' | 'EDIT'>('CREATE');
+  const [editingVaultId, setEditingVaultId] = useState<string | null>(null);
+
+  // Manage Access Modal
+  const [isAccessModalOpen, setIsAccessModalOpen] = useState(false);
+  const [managingVault, setManagingVault] = useState<Vault | null>(null);
+  const [showCancelModal, setShowCancelModal] = useState(false);
+
+  // Form State
+  const [vaultName, setVaultName] = useState('');
+  const [customDomain, setCustomDomain] = useState('');
+  const [vaultType, setVaultType] = useState<VaultType>(VaultType.SENDING);
+  const [receivingConfig, setReceivingConfig] = useState<ReceivingConfig>(DEFAULT_RECEIVING_CONFIG);
+  const [accessLevel, setAccessLevel] = useState<AccessLevel>(AccessLevel.PUBLIC);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [links, setLinks] = useState<string[]>([]);
+  const [tempLink, setTempLink] = useState('');
+  const [expiryHours, setExpiryHours] = useState<number | 'never' | 'custom'>(24);
+  const [customExpiryHours, setCustomExpiryHours] = useState<string>('');
+  const [maxViews, setMaxViews] = useState<number | 'custom' | null>(null);
+  const [customMaxViews, setCustomMaxViews] = useState<string>('');
+
+  const [existingFiles, setExistingFiles] = useState<VaultFile[]>([]);
+  const [deletedFileIds, setDeletedFileIds] = useState<string[]>([]);
+  const [pendingModeSwitch, setPendingModeSwitch] = useState<VaultType | null>(null);
+
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
+
+  // Delete Confirm Modal State
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [vaultPassword, setVaultPassword] = useState('');
+  const [uploadTask, setUploadTask] = useState<0 | 1 | 2 | 3>(0);
+  const [estimatedSeconds, setEstimatedSeconds] = useState<number>(0);
+
+  // Drag and Drop State
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // UI State
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+  const [viewQrVault, setViewQrVault] = useState<Vault | null>(null);
+  const [submittingVault, setSubmittingVault] = useState<Vault | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [selectedFileForSettings, setSelectedFileForSettings] = useState<{ type: 'NEW' | 'EXISTING', index: number } | null>(null);
+  const [fileSettings, setFileSettings] = useState<Record<string, any>>({}); // key is index for NEW, id for EXISTING
+  const [selectedQrDesign, setSelectedQrDesign] = useState<string>('standard');
+  const [selectedQrColor, setSelectedQrColor] = useState<string>('#000000');
+  const [qrLogo, setQrLogo] = useState<string | null>(null);
+  
+  // Vault Control Center Page View
+  const [managedVaultId, setManagedVaultId] = useState<string | null>(null);
+  const [managementTab, setManagementTab] = useState<'edit' | 'access' | 'activity'>('edit');
+  const qrLogoInputRef = useRef<HTMLInputElement>(null);
+
+  const managedVault = useMemo(() => {
+    return vaults.find(v => v.id === managedVaultId) || null;
+  }, [vaults, managedVaultId]);
+
+  // Google Drive State
+  const [googleTokens, setGoogleTokens] = useState<any>(null);
+  const [googleDriveFiles, setGoogleDriveFiles] = useState<any[]>([]);
+  const [isFetchingDrive, setIsFetchingDrive] = useState(false);
+  const [driveStorageUsed, setDriveStorageUsed] = useState(0);
+  const [driveQuota, setDriveQuota] = useState<{ usage: number, limit: number } | null>(null);
+
+  const [isFreeLimitModalOpen, setIsFreeLimitModalOpen] = useState(false);
+  const [deletedLogs, setDeletedLogs] = useState<DeletedVaultLog[]>([]);
+  const [activeTab, setActiveTab] = useState<'vaults' | 'deleted' | 'analytics'>('vaults');
+
+  // Reporting State
+  const [reportVault, setReportVault] = useState<Vault | null>(null);
+  const [vaultReports, setVaultReports] = useState<any[]>([]);
+  const [loadingReports, setLoadingReports] = useState(false);
+
+  // Analytics State
+  const [selectedAnalyticsVault, setSelectedAnalyticsVault] = useState<Vault | null>(null);
+  const [activeAnalyticsTab, setActiveAnalyticsTab] = useState<'overview' | 'engagement' | 'files'>('overview');
+  const [analyticsStartDate, setAnalyticsStartDate] = useState<string>('');
+  const [analyticsEndDate, setAnalyticsEndDate] = useState<string>('');
+  const [analyticsInterval, setAnalyticsInterval] = useState<'Hour' | 'Day' | 'Week'>('Hour');
+  const [analyticsRawLogs, setAnalyticsRawLogs] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (selectedAnalyticsVault) {
+      const createdStr = new Date(selectedAnalyticsVault.createdAt).toISOString().split('T')[0];
+      const todayStr = new Date().toISOString().split('T')[0];
+      setAnalyticsStartDate(createdStr);
+      setAnalyticsEndDate(todayStr);
+      
+      const logs = generateScanLogs(
+        selectedAnalyticsVault,
+        new Date(selectedAnalyticsVault.createdAt),
+        new Date()
+      );
+      setAnalyticsRawLogs(logs);
+    } else {
+      setAnalyticsRawLogs([]);
+    }
+  }, [selectedAnalyticsVault]);
+
+  const analyticsLogs = useMemo(() => {
+    if (!selectedAnalyticsVault || !analyticsStartDate || !analyticsEndDate) return [];
+    const start = new Date(analyticsStartDate);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(analyticsEndDate);
+    end.setHours(23, 59, 59, 999);
+    return analyticsRawLogs.filter(log => log.timestamp >= start && log.timestamp <= end);
+  }, [analyticsRawLogs, analyticsStartDate, analyticsEndDate, selectedAnalyticsVault]);
+
+  const analyticsChartData = useMemo(() => {
+    if (!selectedAnalyticsVault || !analyticsStartDate || !analyticsEndDate) return [];
+    const start = new Date(analyticsStartDate);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(analyticsEndDate);
+    end.setHours(23, 59, 59, 999);
+    return getOverTimeData(analyticsLogs, start, end, analyticsInterval);
+  }, [analyticsLogs, analyticsStartDate, analyticsEndDate, analyticsInterval, selectedAnalyticsVault]);
+
+  const analyticsOsStats = useMemo(() => {
+    const counts: Record<string, number> = {};
+    analyticsLogs.forEach(l => { counts[l.os] = (counts[l.os] || 0) + 1; });
+    const total = analyticsLogs.length || 1;
+    return Object.entries(counts)
+      .map(([os, count]) => ({ name: os, scans: count, pct: Math.round((count / total) * 100) }))
+      .sort((a, b) => b.scans - a.scans);
+  }, [analyticsLogs]);
+
+  const analyticsCountryStats = useMemo(() => {
+    const counts: Record<string, number> = {};
+    analyticsLogs.forEach(l => { counts[l.country] = (counts[l.country] || 0) + 1; });
+    const total = analyticsLogs.length || 1;
+    return Object.entries(counts)
+      .map(([c, count]) => ({ name: c, scans: count, pct: Math.round((count / total) * 100) }))
+      .sort((a, b) => b.scans - a.scans);
+  }, [analyticsLogs]);
+
+  const analyticsCityStats = useMemo(() => {
+    const counts: Record<string, number> = {};
+    analyticsLogs.forEach(l => { counts[l.city] = (counts[l.city] || 0) + 1; });
+    const total = analyticsLogs.length || 1;
+    return Object.entries(counts)
+      .map(([c, count]) => ({ name: c, scans: count, pct: Math.round((count / total) * 100) }))
+      .sort((a, b) => b.scans - a.scans);
+  }, [analyticsLogs]);
+
+  const [activeModalTab, setActiveModalTab] = useState<'identity' | 'content' | 'lifecycle' | 'security' | 'design'>('identity');
+
+  const handleModeConfirm = (newType: VaultType) => {
+    setVaultType(newType);
+    setVaultName('');
+    setSelectedFiles([]);
+    setLinks([]);
+    setExistingFiles([]);
+    setDeletedFileIds([]);
+    setVaultPassword('');
+    setCustomDomain('');
+    setReceivingConfig(DEFAULT_RECEIVING_CONFIG);
+    setActiveModalTab('identity');
+  };
+
+  const handleModeChange = (newType: VaultType) => {
+    if (newType === vaultType) return;
+    setPendingModeSwitch(newType);
+  };
+
+  useEffect(() => {
+    const targetVaultId = managedVaultId || reportVault?.id;
+    if (targetVaultId) {
+      setLoadingReports(true);
+      supabase.from('reports')
+        .select('*')
+        .eq('vault_id', targetVaultId)
+        .order('created_at', { ascending: false })
+        .then(({ data }: { data: any[] | null }) => {
+          setVaultReports(data || []);
+          setLoadingReports(false);
+        });
+    }
+  }, [managedVaultId, reportVault]);
+
+  useEffect(() => {
+    if (reportVault) {
+      setManagedVaultId(reportVault.id);
+      setManagementTab('activity');
+      setReportVault(null);
+    }
+  }, [reportVault]);
+
+  useEffect(() => {
+    // Immediate redirect if not authenticated
+    if (!isAuthenticated) {
+      navigate('/login');
+      return;
+    }
+
+    // Load data if authenticated
+    if (userId) {
+      loadData(userId);
+    } else {
+      setIsLoading(false);
+    }
+
+    // Load Google Tokens from local storage if available
+    const savedTokens = localStorage.getItem('google_drive_tokens');
+    if (savedTokens) {
+      try {
+        const tokens = JSON.parse(savedTokens);
+        setGoogleTokens(tokens);
+        fetchGoogleDriveFiles(tokens);
+        fetchDriveStorageUsage(tokens);
+      } catch (e) {
+        console.error("Failed to parse saved google tokens");
+      }
+    }
+
+    const handleMessage = (event: MessageEvent) => {
+      // Be more permissible for cross-domain auth if the message type is explicitly our auth success message.
+      // Netlify frontend domain might be receiving message from Render backend domain.
+      if (event.data?.type === 'GOOGLE_AUTH_SUCCESS') {
+        const tokens = event.data.tokens;
+        setGoogleTokens(tokens);
+        localStorage.setItem('google_drive_tokens', JSON.stringify(tokens));
+        fetchGoogleDriveFiles(tokens);
+        fetchDriveStorageUsage(tokens);
+        toast.success("Google Drive Connected");
+        openCreateModal();
+      }
+    };
+    window.addEventListener('message', handleMessage);
+
+    // If this window is a popup (opened by window.open), close it after auth
+    if (window.opener && window.location.hash.includes('access_token=')) {
+      // Supabase sets the session in hash after redirect
+      // The parent window will detect the session change via onAuthStateChange
+      window.close();
+    }
+
+    const handleClickOutside = () => setMenuOpenId(null);
+    window.addEventListener('click', handleClickOutside);
+    return () => {
+      window.removeEventListener('message', handleMessage);
+      window.removeEventListener('click', handleClickOutside);
+    };
+  }, [isAuthenticated, userId, navigate, userEmail]);
+
+  useEffect(() => {
+    if (appUser?.subscriptionExpiryDate) {
+      const updateTimer = () => {
+        const now = new Date().getTime();
+        const expiry = new Date(appUser.subscriptionExpiryDate!).getTime();
+        const distance = expiry - now;
+
+        if (distance < 0) {
+          setTimeLeft('Expired');
+          return;
+        }
+
+        const days = Math.floor(distance / (1000 * 60 * 60 * 24));
+        const hours = Math.floor((distance % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const minutes = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
+        const months = Math.floor(days / 30);
+
+        if (months > 0) {
+          setTimeLeft(`${months} months, ${days % 30} days left`);
+        } else if (days > 0) {
+          setTimeLeft(`${days} days left`);
+        } else {
+          setTimeLeft(`${hours}h ${minutes}m left`);
+        }
+      };
+
+      updateTimer(); // Initial call
+      const timer = setInterval(updateTimer, 60000); // Update every minute
+      return () => clearInterval(timer);
+    }
+  }, [appUser]);
+
+  const downloadInvoice = (inv: Invoice) => {
+    const invoiceHtml = `<!DOCTYPE html><html><head><title>Invoice - ${inv.id}</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;padding:40px;color:#333;background:#fff}.header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:40px;border-bottom:3px solid #7c3aed;padding-bottom:20px}.logo{font-size:28px;font-weight:800;color:#7c3aed}.logo span{color:#333}.invoice-info{text-align:right}.invoice-info h2{font-size:22px;color:#333;margin-bottom:4px}.invoice-info p{font-size:13px;color:#888}.details{display:flex;justify-content:space-between;margin-bottom:40px}.details .col h4{font-size:11px;text-transform:uppercase;color:#999;letter-spacing:1px;margin-bottom:8px}.details .col p{font-size:14px;color:#333;margin-bottom:4px}table{width:100%;border-collapse:collapse;margin-bottom:30px}th{background:#f5f3ff;color:#7c3aed;text-align:left;padding:12px 16px;font-size:12px;text-transform:uppercase;letter-spacing:.5px}td{padding:14px 16px;border-bottom:1px solid #eee;font-size:14px}.total-row td{font-weight:700;font-size:16px;border-top:2px solid #7c3aed;border-bottom:none}.footer{text-align:center;margin-top:40px;padding-top:20px;border-top:1px solid #eee;color:#999;font-size:12px}.paid-stamp{display:inline-block;border:3px solid #22c55e;color:#22c55e;padding:4px 20px;border-radius:8px;font-size:18px;font-weight:800;text-transform:uppercase;transform:rotate(-5deg);margin-left:20px}</style></head><body><div class="header"><div><div class="logo"><span>QR</span> Vault</div><p style="font-size:13px;color:#888;margin-top:4px">Secure File Storage & Sharing</p></div><div class="invoice-info"><h2>INVOICE</h2><p>${inv.id}</p><p>${inv.date}</p></div></div><div class="details"><div class="col"><h4>Billed To</h4><p>${appUser?.email || 'N/A'}</p></div><div class="col" style="text-align:right"><h4>Plan Details</h4><p>${inv.plan} Plan - Monthly</p><p>Valid until: ${inv.expiry}</p></div></div><table><thead><tr><th>Description</th><th>Qty</th><th style="text-align:right">Amount</th></tr></thead><tbody><tr><td>${inv.plan} Plan — Monthly Subscription</td><td>1</td><td style="text-align:right">₹${inv.amount}.00</td></tr><tr class="total-row"><td colspan="2">Total</td><td style="text-align:right">₹${inv.amount}.00</td></tr></tbody></table><div style="margin-bottom:30px"><span class="paid-stamp">✓ PAID</span></div><div class="footer"><p>Thank you for your purchase! This is a computer-generated invoice.</p><p style="margin-top:4px">QR Vault — Secure File Storage & Sharing</p></div></body></html>`;
+    const w = window.open('', '_blank');
+    if (w) { w.document.write(invoiceHtml); w.document.close(); setTimeout(() => w.print(), 500); }
+  };
+
+  const loadData = async (uid: string) => {
+    try {
+      const v = await mockService.getVaults(uid);
+      setVaults(v);
+
+      // Fetch User from Service, passing current email to ensure correct profile
+      try {
+        const u = await mockService.getUser(uid, userEmail || undefined);
+        setAppUser(u);
+      } catch (err) {
+        console.error("Failed to fetch user profile", err);
+      }
+
+      // Fetch Invoices independently to prevent blocking dashboard on table missing errors
+      try {
+        const invs = await mockService.getUserInvoices(uid);
+        setInvoices(invs);
+      } catch (err) {
+        console.warn("Failed to fetch invoices (table might be missing)", err);
+      }
+      // Fetch Deleted Logs
+      try {
+        const { data: logs, error: logsError } = await supabase
+          .from('deleted_vault_logs')
+          .select('*')
+          .eq('user_id', uid)
+          .order('deleted_at', { ascending: false })
+          .limit(5);
+
+        if (!logsError && logs) {
+          setDeletedLogs(logs as DeletedVaultLog[]);
+        }
+      } catch (err) {
+        console.warn("Failed to fetch deleted logs", err);
+      }
+    } catch (e) {
+      console.error("Critical failure in loadData", e);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const isPaidPlan = appUser ? (appUser.plan === PlanType.STARTER || appUser.plan === PlanType.PRO) : false;
+  const needsDriveConnection = isPaidPlan && !googleTokens;
+
+  const isOverLimit = useMemo(() => {
+    if (!appUser) return false;
+    if (isPaidPlan && googleTokens) {
+      // For paid plans, check Drive storage against plan limit
+      return driveStorageUsed >= appUser.storageLimit;
+    }
+    return appUser.storageUsed >= appUser.storageLimit;
+  }, [appUser, isPaidPlan, googleTokens, driveStorageUsed]);
+
+  // --- Search & Filter Logic ---
+  const filteredVaults = useMemo(() => {
+    let result = [...vaults];
+
+    if (searchTerm) {
+      result = result.filter(v => v.name.toLowerCase().includes(searchTerm.toLowerCase()));
+    }
+
+    const now = new Date();
+    if (filterTime === '10-days') {
+      const cutoff = new Date();
+      cutoff.setDate(now.getDate() - 10);
+      result = result.filter(v => new Date(v.createdAt) >= cutoff);
+    } else if (filterTime === '30-days') {
+      const cutoff = new Date();
+      cutoff.setDate(now.getDate() - 30);
+      result = result.filter(v => new Date(v.createdAt) >= cutoff);
+    }
+
+    const getVaultSize = (v: Vault) => v.files.reduce((acc, f) => acc + f.size, 0);
+
+    result.sort((a, b) => {
+      switch (sortOption) {
+        case 'name-asc': return a.name.localeCompare(b.name);
+        case 'name-desc': return b.name.localeCompare(a.name);
+        case 'size-desc': return getVaultSize(b) - getVaultSize(a);
+        case 'size-asc': return getVaultSize(a) - getVaultSize(b);
+        case 'date-oldest': return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+        case 'date-newest':
+        default: return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      }
+    });
+
+    return result;
+  }, [vaults, searchTerm, filterTime, sortOption]);
+
+
+  // --- Actions ---
+
+  const handleActionBlocked = () => {
+    toast.error("Account limit reached", { description: "Your data is secure, but you must upgrade to add or remove files." });
+  };
+
+  const openCreateModal = () => {
+    // Check Free Plan Limit
+    if (appUser?.plan === PlanType.FREE && vaults.length >= 2) {
+      setIsFreeLimitModalOpen(true);
+      return;
+    }
+
+    // Check Drive Quota Limit
+    if (googleTokens && driveQuota && driveQuota.limit > 0) {
+      if (driveQuota.usage >= driveQuota.limit * 0.99) {
+        toast.error("Google Drive Storage Full", { description: "Please clear unwanted data from your google drive to make new vaults." });
+        return;
+      }
+    }
+
+    if (isOverLimit) {
+      handleActionBlocked();
+      return;
+    }
+    setModalMode('CREATE');
+    setEditingVaultId(null);
+    setVaultName('');
+    setAccessLevel(AccessLevel.PUBLIC);
+    setSelectedFiles([]);
+    setLinks([]);
+    setExistingFiles([]);
+    setDeletedFileIds([]);
+    setExpiryHours(appUser?.plan === PlanType.FREE ? 24 : 24); // DEFAULT 24
+    setMaxViews(appUser?.plan === PlanType.PRO ? null : 25);
+    setCustomMaxViews('');
+    setVaultPassword('');
+    setCustomDomain('');
+    setVaultType(VaultType.SENDING);
+    setReceivingConfig(DEFAULT_RECEIVING_CONFIG);
+    setActiveModalTab('identity');
+    setIsModalOpen(true);
+  };
+
+  const openEditModal = (vault: Vault, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpenId(null);
+    if (isOverLimit) {
+      handleActionBlocked();
+      return;
+    }
+
+    setModalMode('EDIT');
+    setEditingVaultId(vault.id);
+    setVaultName(vault.name);
+    setAccessLevel(vault.accessLevel || AccessLevel.PUBLIC);
+    setSelectedFiles([]);
+    setLinks([]);
+    setCustomDomain(vault.customDomain || '');
+    setExistingFiles(vault.files);
+    setDeletedFileIds([]);
+    setVaultType(vault.vaultType || VaultType.SENDING);
+    setReceivingConfig(vault.receivingConfig || DEFAULT_RECEIVING_CONFIG);
+
+    // In edit mode, try to infer expiryHours if possible or just set it
+    if (vault.expiresAt) {
+      const diff = new Date(vault.expiresAt).getTime() - new Date(vault.createdAt).getTime();
+      const hours = Math.max(1, Math.round(diff / (1000 * 60 * 60)));
+      if (hours === 24 || hours === 48 || hours === 72) {
+        setExpiryHours(hours);
+        setCustomExpiryHours('');
+      } else {
+        setExpiryHours('custom');
+        setCustomExpiryHours(hours.toString());
+      }
+    } else {
+      setExpiryHours('never');
+      setCustomExpiryHours('');
+    }
+
+    if (vault.maxViews) {
+      setMaxViews(vault.maxViews);
+      setCustomMaxViews(vault.maxViews.toString());
+    } else {
+      setMaxViews(null);
+      setCustomMaxViews('');
+    }
+
+    setActiveModalTab('identity');
+    setManagedVaultId(vault.id);
+    setManagementTab('edit');
+  };
+
+  const openManageAccess = (vault: Vault, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpenId(null);
+    setManagingVault(vault);
+    setManagedVaultId(vault.id);
+    setManagementTab('access');
+  };
+
+  const handleAccessResolution = async (vaultId: string, requestId: string, status: RequestStatus) => {
+    if (!appUser) return;
+    await mockService.manageAccessRequest(appUser.id, vaultId, requestId, status);
+    // Refresh local data for modal
+    const updatedVaults = await mockService.getVaults(appUser.id);
+    setVaults(updatedVaults);
+    const updatedVault = updatedVaults.find(v => v.id === vaultId);
+    if (updatedVault) setManagingVault(updatedVault);
+  };
+
+  const uploadFileToDrive = async (file: File, folderId: string, onProgress?: (loaded: number) => void) => {
+    const authHeader = await mockService.getAuthHeader();
+    if (!authHeader.Authorization) {
+      throw new Error('Authorization header is required');
+    }
+
+    return new Promise<any>((resolve, reject) => {
+      const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('tokens', JSON.stringify(googleTokens));
+      formData.append('folderId', folderId);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${apiBase}/api/google-drive/upload-file`, true);
+      
+      // Add Supabase JWT for backend authentication - already awaited above
+      xhr.setRequestHeader('Authorization', authHeader.Authorization);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && onProgress) {
+          onProgress(e.loaded);
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText));
+          } catch (e) {
+            reject(new Error('Invalid server response'));
+          }
+        } else {
+          let errorMsg = 'Failed to upload file to Drive';
+          try {
+            const errorData = JSON.parse(xhr.responseText);
+            errorMsg = errorData.error || errorMsg;
+          } catch (e) {
+            errorMsg = `Server error (${xhr.status})`;
+          }
+          reject(new Error(errorMsg));
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('Network error during upload'));
+      xhr.send(formData);
+    });
+  };
+
+  const handleSubmit = async () => {
+    if (!vaultName || !appUser) return;
+    if (modalMode === 'CREATE' && selectedFiles.length === 0 && links.length === 0) return;
+    if (isOverLimit) {
+      handleActionBlocked();
+      return;
+    }
+
+    const totalNewSize = selectedFiles.reduce((acc, f) => acc + f.size, 0);
+    const projectedStorage = (googleTokens ? driveStorageUsed : appUser.storageUsed) + totalNewSize;
+
+    if (projectedStorage > appUser.storageLimit) {
+      toast.error("Upload failed", { description: `This vault exceeds your total ${formatBytes(appUser.storageLimit, 0)} storage plan limit. Please delete files or upgrade your plan.` });
+      return;
+    }
+
+    setIsSubmitting(true);
+    setUploadProgress(0);
+    setUploadTask(1); // Security scan / Initializing
+    let success = false;
+    const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
+    // Calculate Expires At
+    let expiresAt: string | undefined = undefined;
+    if (expiryHours !== 'never') {
+      const now = new Date();
+      if (expiryHours === 'custom') {
+        const hours = parseInt(customExpiryHours) || 24;
+        now.setHours(now.getHours() + hours);
+      } else {
+        now.setHours(now.getHours() + Number(expiryHours));
+      }
+      expiresAt = now.toISOString();
+    }
+
+    let finalMaxViews: number | undefined = undefined;
+    if (maxViews === 'custom') {
+      finalMaxViews = parseInt(customMaxViews) || undefined;
+    } else if (maxViews !== null) {
+      finalMaxViews = Number(maxViews);
+    }
+
+    const totalSize = selectedFiles.reduce((acc, file) => acc + file.size, 0);
+    const fileProgresses = new Array(selectedFiles.length).fill(0);
+    const startTime = Date.now();
+    let lastBytesLoaded = 0;
+    let lastUpdateTime = Date.now();
+    let smoothedSpeed = 0;
+
+    try {
+      let finalFiles: (File | any)[] = [...selectedFiles];
+
+      // If Drive is connected, use Drive as primary storage to bypass direct Supabase API limits
+      if (googleTokens) {
+        // 1. Ensure QRVM folder
+        const ensureRes = await fetch(`${apiBase}/api/google-drive/ensure-folder`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            ...(await mockService.getAuthHeader())
+          },
+          body: JSON.stringify({ tokens: googleTokens }),
+        });
+        const folderData = await ensureRes.json();
+        if (!ensureRes.ok) throw new Error(folderData.error || 'Failed to ensure QRVM folder');
+
+        // 2. Create/Find Vault folder
+        const saveRes = await fetch(`${apiBase}/api/google-drive/save-vault`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            ...(await mockService.getAuthHeader())
+          },
+          body: JSON.stringify({
+            tokens: googleTokens,
+            folderId: folderData.folderId,
+            vault: { name: vaultName, id: editingVaultId || 'temp', files: [] },
+            qrSvg: null, // Don't need QR yet
+          }),
+        });
+        const saveData = await saveRes.json();
+        if (!saveRes.ok) throw new Error(saveData.error || 'Failed to create vault folder on Drive');
+        const vaultFolderId = saveData.vaultFolderId;
+
+        // 3. Parallel Upload to Drive
+        const uploadPromises = selectedFiles.map((file, index) => {
+          return uploadFileToDrive(file, vaultFolderId, (loaded) => {
+            fileProgresses[index] = loaded;
+            const totalLoaded = fileProgresses.reduce((a, b) => a + b, 0);
+
+            // Progress Calculation (0-98%)
+            const percent = totalSize > 0 ? Math.min(Math.round((totalLoaded / totalSize) * 98), 98) : 50;
+            setUploadProgress(percent);
+
+            // Smoothed Time Estimation (Rolling Average)
+            const now = Date.now();
+            const timeDiff = (now - lastUpdateTime) / 1000;
+            if (timeDiff >= 0.5) { // Update speed every 0.5s for smoothness
+              const bytesSinceLast = totalLoaded - lastBytesLoaded;
+              const currentSpeed = bytesSinceLast / timeDiff;
+
+              // Exponential Moving Average (EMA) to prevent jumps
+              if (smoothedSpeed === 0) smoothedSpeed = currentSpeed;
+              else smoothedSpeed = (smoothedSpeed * 0.8) + (currentSpeed * 0.2);
+
+              lastBytesLoaded = totalLoaded;
+              lastUpdateTime = now;
+
+              if (smoothedSpeed > 0) {
+                const remainingBytes = totalSize - totalLoaded;
+                const remainingSec = Math.max(1, Math.ceil(remainingBytes / smoothedSpeed));
+                setEstimatedSeconds(remainingSec);
+              }
+            }
+
+            // Task Pipeline UI
+            if (percent > 10 && percent <= 60) setUploadTask(2); // Encryption processing
+            if (percent > 60) setUploadTask(3); // Finalizing server distribution
+          });
+        });
+
+        const driveResults = await Promise.all(uploadPromises);
+        finalFiles = driveResults.map((driveFile, i) => ({
+          name: driveFile.name,
+          size: driveFile.size || selectedFiles[i].size,
+          type: selectedFiles[i].type.startsWith('image/')
+            ? FileType.IMAGE
+            : (selectedFiles[i].type.startsWith('video/')
+              ? FileType.VIDEO
+              : (selectedFiles[i].type === 'application/pdf' ? FileType.PDF : FileType.OTHER)),
+          mimeType: selectedFiles[i].type,
+          url: driveFile.webViewLink,
+          settings: fileSettings[i]
+        }));
+      } else {
+        // Supabase only: attach settings directly to file objects
+        finalFiles = selectedFiles.map((f, i) => {
+          (f as any).settings = fileSettings[i];
+          return f;
+        });
+      }
+
+      // Update existing files settings for EDIT mode
+      if (modalMode === 'EDIT') {
+        setExistingFiles(prev => prev.map(f => {
+          const settings = fileSettings[f.id];
+          if (settings) {
+            return {
+              ...f,
+              maxDownloads: settings.maxDownloads,
+              expiresAt: settings.expiresAt,
+              deleteAfterMinutes: settings.deleteAfterMinutes
+            };
+          }
+          return f;
+        }));
+      }
+
+      setUploadTask(3); // Finalizing
+      if (modalMode === 'CREATE') {
+        await mockService.createVault(appUser.id, vaultName, finalFiles, links, accessLevel, appUser.email, expiresAt, finalMaxViews, vaultPassword, customDomain, vaultType, receivingConfig);
+      } else if (modalMode === 'EDIT' && editingVaultId) {
+        await mockService.updateVault(appUser.id, editingVaultId, vaultName, finalFiles, links, deletedFileIds, accessLevel, appUser.email, expiresAt, finalMaxViews, vaultPassword, customDomain, vaultType, receivingConfig);
+      }
+
+      success = true;
+
+      // Auto-save metadata (and QR) to Google Drive if connected
+      if (googleTokens) {
+        try {
+          const updatedVaults = await mockService.getVaults(appUser.id);
+          const latestVault = updatedVaults.sort((a, b) =>
+            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          )[0];
+          if (latestVault) {
+            await saveVaultToDrive(latestVault);
+            // Refresh Drive storage usage after saving
+            await fetchDriveStorageUsage(googleTokens);
+          }
+        } catch (driveErr) {
+          console.error('Auto-sync to Drive failed:', driveErr);
+        }
+      }
+
+      setUploadProgress(100);
+      setEstimatedSeconds(0);
+      await new Promise(r => setTimeout(r, 800)); // show 100% briefly
+      setIsModalOpen(false);
+      setManagedVaultId(null);
+    } catch (e: any) {
+      console.error(e);
+      setUploadProgress(0);
+      setUploadTask(0);
+      toast.error("Upload failed", { description: e.message });
+    } finally {
+      await loadData(appUser.id);
+      setIsSubmitting(false);
+      setUploadTask(0);
+      setEstimatedSeconds(0);
+    }
+  };
+
+  const handleRecoverVault = async (log: DeletedVaultLog) => {
+    if (!appUser) return;
+    if (appUser.plan === PlanType.FREE) {
+      toast.error("Upgrade required", { description: "Vault recovery is only available for Plus and Pro members. Please upgrade to recover your data." });
+      return;
+    }
+
+    if (!googleTokens) {
+      toast.error("Cloud Connection Required", { description: "Please connect your Google Drive to recover vaults stored there." });
+      return;
+    }
+
+    const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+    setIsSubmitting(true);
+
+    try {
+      // 1. Get Folder ID
+      const ensureRes = await fetch(`${apiBase}/api/google-drive/ensure-folder`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(await mockService.getAuthHeader())
+        },
+        body: JSON.stringify({ tokens: googleTokens }),
+      });
+      const folderData = await ensureRes.json();
+      if (!ensureRes.ok) throw new Error("Failed to access Google Drive root folder.");
+
+      // 2. Search and list files
+      const listRes = await fetch(`${apiBase}/api/google-drive/list-vault-files`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(await mockService.getAuthHeader())
+        },
+        body: JSON.stringify({
+          tokens: googleTokens,
+          folderId: folderData.folderId,
+          vaultName: log.vault_name
+        }),
+      });
+
+      const listData = await listRes.json();
+      if (!listRes.ok) {
+        throw new Error(listData.error || "your data is not still in google data not found yet !!");
+      }
+
+      // 3. Recover in Supabase
+      await mockService.recoverVault(appUser.id, log.vault_name, listData.files);
+
+      toast.success(`Successfully recovered "${log.vault_name}"!`);
+      await loadData(appUser.id);
+    } catch (err: any) {
+      toast.error("Recovery failed", { description: err.message });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleDeleteVault = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpenId(null);
+    if (!appUser) return;
+
+    if (isOverLimit) {
+      handleActionBlocked();
+      return;
+    }
+
+    const vaultToDelete = vaults.find(v => v.id === id);
+    if (!vaultToDelete) return;
+
+    // Show custom confirm dialog instead of browser confirm()
+    setDeleteConfirmId(id);
+  };
+
+  const confirmDeleteVault = async () => {
+    if (!appUser || !deleteConfirmId) return;
+    const id = deleteConfirmId;
+    const vaultToDelete = vaults.find(v => v.id === id);
+    if (!vaultToDelete) { setDeleteConfirmId(null); return; }
+
+    setIsDeleting(true);
+    try {
+      // 1. If Google Drive is connected, delete the folder from Drive
+      if (googleTokens) {
+        const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
+        // First, get the QRVM folder ID
+        const ensureRes = await fetch(`${apiBase}/api/google-drive/ensure-folder`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            ...(await mockService.getAuthHeader())
+          },
+          body: JSON.stringify({ tokens: googleTokens }),
+        });
+        const folderData = await ensureRes.json();
+
+        if (ensureRes.ok && folderData.folderId) {
+          await fetch(`${apiBase}/api/google-drive/delete-vault`, {
+            method: 'POST',
+            headers: { 
+            'Content-Type': 'application/json',
+            ...(await mockService.getAuthHeader())
+          },
+            body: JSON.stringify({
+              tokens: googleTokens,
+              folderId: folderData.folderId,
+              vaultName: vaultToDelete.name
+            }),
+          });
+        }
+      }
+
+      // 2. Delete from Supabase (handled inside deleteVault) and DB
+      await mockService.deleteVault(appUser.id, id);
+
+      // 3. Refresh Drive storage usage if connected
+      if (googleTokens) {
+        await fetchDriveStorageUsage(googleTokens);
+      }
+    } catch (error: any) {
+      toast.error("Delete failed", { description: error.message || "Could not delete vault. Please try again." });
+    } finally {
+      setIsDeleting(false);
+      setDeleteConfirmId(null);
+      await loadData(appUser.id);
+    }
+  };
+
+  const handleMarkFileDeleted = (fileId: string) => {
+    if (isOverLimit) {
+      handleActionBlocked();
+      return;
+    }
+    setDeletedFileIds([...deletedFileIds, fileId]);
+    setExistingFiles(existingFiles.filter(f => f.id !== fileId));
+  };
+
+  const downloadQrCode = () => {
+    const svg = document.getElementById("qr-code-svg");
+    if (!svg) return;
+    const svgData = new XMLSerializer().serializeToString(svg);
+    const blob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${viewQrVault?.name.replace(/[^a-z0-9]/gi, '_')}-qr.svg`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // --- Form Handlers ---
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      setSelectedFiles(prev => [...prev, ...Array.from(e.target.files!)]);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      setSelectedFiles(prev => [...prev, ...Array.from(e.dataTransfer.files)]);
+      e.dataTransfer.clearData();
+    }
+  };
+
+  const removeSelectedFile = (index: number) => {
+    setSelectedFiles(selectedFiles.filter((_, i) => i !== index));
+  };
+
+  const addLink = () => {
+    if (tempLink) {
+      setLinks([...links, tempLink]);
+      setTempLink('');
+    }
+  };
+
+  const removeLink = (index: number) => {
+    setLinks(links.filter((_, i) => i !== index));
+  };
+
+  // --- Utils ---
+  const toggleMenu = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    setMenuOpenId(menuOpenId === id ? null : id);
+  };
+
+  const formatBytes = (bytes: number, decimals = 2) => {
+    if (!+bytes) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+  };
+
+  const getQrUrl = (vault: Vault) => {
+    // Robust URL generation: Support custom domains for PRO users
+    if (vault.customDomain && vault.userPlan === PlanType.PRO) {
+      return `https://${vault.customDomain}/v/${vault.id}`;
+    }
+    const origin = window.location.origin;
+    return `${origin}/v/${vault.id}`;
+  };
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleConnectGoogleDrive = async () => {
+    try {
+      console.log('Connecting to Google Drive...');
+      const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+      console.log('apiBase:', apiBase);
+      const response = await fetch(`${apiBase}/api/google/auth`);
+
+      // Check if response is JSON
+      const contentType = response.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        const text = await response.text();
+        console.error('Expected JSON but got:', text);
+        throw new Error(`Server returned an invalid response (not JSON). Status: ${response.status}. Body: ${text.substring(0, 100)}`);
+      }
+
+      const data = await response.json();
+
+      if (!response.ok || !data.authUrl) {
+        throw new Error(data.error || data.details || 'Failed to get auth URL');
+      }
+
+      console.log('Opening auth popup...');
+      const authWindow = window.open(
+        data.authUrl,
+        'google_oauth_popup',
+        'width=600,height=700'
+      );
+
+      if (!authWindow) {
+        toast.warning("Pop-up Blocked", { description: "Please allow popups for this site to connect your Google Drive." });
+      }
+    } catch (error: any) {
+      console.error('Failed to get Google Auth URL', error);
+      toast.error("Google Connection Error", { description: `Failed to initialize: ${error.message}` });
+    }
+  };
+
+  const fetchGoogleDriveFiles = async (tokens: any) => {
+    setIsFetchingDrive(true);
+    try {
+      const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+      const response = await fetch(`${apiBase}/api/google-drive/list`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(await mockService.getAuthHeader())
+        },
+        body: JSON.stringify({ tokens }),
+      });
+
+      if (response.status === 401 || response.status === 500) {
+        // If the server returns an error, it might be due to invalid tokens
+        console.error('Failed to fetch Drive files, disconnecting...');
+        disconnectGoogleDrive();
+        return;
+      }
+
+      const data = await response.json();
+      setGoogleDriveFiles(data.files || []);
+    } catch (error) {
+      console.error('Failed to fetch Drive files', error);
+    } finally {
+      setIsFetchingDrive(false);
+    }
+  };
+
+  const disconnectGoogleDrive = () => {
+    setGoogleTokens(null);
+    setGoogleDriveFiles([]);
+    setDriveStorageUsed(0);
+    localStorage.removeItem('google_drive_tokens');
+  };
+
+  const fetchDriveStorageUsage = async (tokens: any) => {
+    try {
+      const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+      const res = await fetch(`${apiBase}/api/google-drive/storage-usage`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(await mockService.getAuthHeader())
+        },
+        body: JSON.stringify({ tokens }),
+      });
+      if (res.status === 401 || res.status === 500) {
+        console.error('Failed to fetch Drive storage usage, disconnecting...');
+        disconnectGoogleDrive();
+        return;
+      }
+      if (res.ok) {
+        const data = await res.json();
+        setDriveStorageUsed(data.totalBytes || 0);
+        if (data.driveQuota) {
+          setDriveQuota(data.driveQuota);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch Drive storage usage', err);
+    }
+  };
+
+  const saveVaultToDrive = async (vault: Vault) => {
+    if (!googleTokens) return;
+    const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
+    try {
+      console.log('[Drive Sync] Ensuring QRVM folder...');
+      const folderRes = await fetch(`${apiBase}/api/google-drive/ensure-folder`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(await mockService.getAuthHeader())
+        },
+        body: JSON.stringify({ tokens: googleTokens }),
+      });
+      const folderData = await folderRes.json();
+      if (!folderRes.ok) throw new Error(folderData.error || 'Failed to ensure folder');
+
+      // Generate QR SVG string
+      const qrUrl = `${window.location.origin}/v/${vault.id}`;
+      const qrSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><rect fill="white" width="200" height="200"/><text x="100" y="90" text-anchor="middle" font-size="12" fill="#333">QR for: ${vault.name}</text><text x="100" y="115" text-anchor="middle" font-size="10" fill="#7c3aed">${qrUrl}</text></svg>`;
+
+      console.log('[Drive Sync] Saving vault data...');
+      const saveRes = await fetch(`${apiBase}/api/google-drive/save-vault`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(await mockService.getAuthHeader())
+        },
+        body: JSON.stringify({
+          tokens: googleTokens,
+          folderId: folderData.folderId,
+          vault,
+          qrSvg,
+        }),
+      });
+      const saveData = await saveRes.json();
+      if (!saveRes.ok) throw new Error(saveData.error || 'Failed to save vault');
+
+      console.log('[Drive Sync] Vault saved to Drive successfully!');
+    } catch (error) {
+      console.error('[Drive Sync] Error saving to Drive:', error);
+    }
+  };
+
+  const getPendingRequestCount = (vault: Vault) => {
+    return (vault.requests || []).filter(r => r.status === RequestStatus.PENDING).length;
+  };
+
+  const storageUsedDisplay = (isPaidPlan && googleTokens) ? driveStorageUsed : (appUser?.storageUsed || 0);
+
+  const data = appUser ? [
+    { name: 'Used', value: storageUsedDisplay },
+    { name: 'Free', value: Math.max(0, appUser.storageLimit - storageUsedDisplay) },
+  ] : [];
+
+  // Use current theme to set pie colors
+  const { theme, toggleTheme } = useTheme();
+  const COLORS = isOverLimit
+    ? ['#ef4444', theme === 'dark' ? '#450a0a' : '#fee2e2']
+    : ['#7c3aed', theme === 'dark' ? '#1e1b4b' : '#f5f3ff'];
+
+  const renderFormContent = () => {
+    return (
+      <>
+        {/* Vault Mode Selector - Fixed Horizontal Layout */}
+        <div className="mb-8">
+          <div className="flex bg-gray-100/80 dark:bg-[#0a0a0a] rounded-2xl border border-gray-200/50 dark:border-white/5 p-1.5 relative shadow-inner max-w-md mx-auto">
+            {/* Animated Background Pill */}
+            <div 
+              className={`absolute top-1.5 bottom-1.5 w-[calc(50%-0.375rem)] bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-white/10 transition-transform duration-500 ease-out pointer-events-none z-0 ${vaultType === VaultType.RECEIVING ? 'translate-x-[calc(100%+0.375rem)]' : 'translate-x-0'}`} 
+            />
+            
+            {modalMode === 'EDIT' ? (
+              <>
+                <div className="absolute inset-0 flex items-center justify-center z-20 bg-gray-100/10 dark:bg-black/10 backdrop-blur-[0.5px] rounded-2xl">
+                  <div className="flex items-center gap-1.5 px-3 py-1 bg-white/90 dark:bg-gray-800/90 text-gray-500 dark:text-gray-400 border border-gray-200/50 dark:border-white/5 rounded-full shadow-sm text-[10px] font-black uppercase tracking-widest">
+                    <Lock size={12} /> Mode Locked
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled
+                  className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black uppercase tracking-widest z-10 whitespace-nowrap cursor-not-allowed opacity-50 ${vaultType === VaultType.SENDING ? 'text-primary-600 dark:text-white' : 'text-gray-500'}`}
+                >
+                  <Send className="w-4 h-4" /> Sharing Mode
+                </button>
+                <button
+                  type="button"
+                  disabled
+                  className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black uppercase tracking-widest z-10 whitespace-nowrap cursor-not-allowed opacity-50 ${vaultType === VaultType.RECEIVING ? 'text-primary-600 dark:text-white' : 'text-gray-500'}`}
+                >
+                  <Inbox className="w-4 h-4" /> Collective Mode
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => handleModeChange(VaultType.SENDING)}
+                  className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-colors duration-300 z-10 whitespace-nowrap ${vaultType === VaultType.SENDING ? 'text-primary-600 dark:text-white' : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'}`}
+                >
+                  <Send className="w-4 h-4" /> Sharing Mode
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleModeChange(VaultType.RECEIVING)}
+                  className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-colors duration-300 z-10 whitespace-nowrap ${vaultType === VaultType.RECEIVING ? 'text-primary-600 dark:text-white' : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'}`}
+                >
+                  <Inbox className="w-4 h-4" /> Collective Mode
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {activeModalTab === 'identity' && (
+          <div className="space-y-8 animate-in fade-in slide-in-from-right-4">
+            {/* PRIMARY IDENTITY */}
+            <div className="space-y-4">
+              <label className="block text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] ml-1">Vault Identity</label>
+              <div className="relative group">
+                <div className="absolute left-6 top-1/2 -translate-y-1/2 w-10 h-10 bg-primary-50 dark:bg-primary-900/30 rounded-xl flex items-center justify-center text-primary-600 border border-primary-100 dark:border-primary-500/20 group-focus-within:scale-110 transition-transform">
+                  <QrCode className="w-5 h-5" />
+                </div>
+                <input
+                  type="text"
+                  className="w-full pl-20 pr-6 py-5 bg-white dark:bg-black border border-gray-200 dark:border-gray-800 rounded-2xl focus:ring-4 focus:ring-primary-500/10 outline-none transition-all font-black text-sm dark:text-white shadow-inner hover:border-primary-300 dark:hover:border-primary-700"
+                  value={vaultName}
+                  onChange={(e) => setVaultName(e.target.value)}
+                  placeholder="ENTER VAULT NAME..."
+                />
+              </div>
+            </div>
+
+            {/* Branded Domain */}
+            <div className="bg-white/50 dark:bg-white/[0.02] p-8 rounded-[2rem] border border-gray-100 dark:border-white/5 space-y-4 shadow-sm">
+               <div className="flex items-center gap-2 mb-2">
+                 <Globe className="w-5 h-5 text-primary-500" />
+                 <span className="text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-widest">Custom Host</span>
+               </div>
+               <input
+                    type="text"
+                    disabled={appUser?.plan !== PlanType.PRO}
+                    className={`w-full px-6 py-5 bg-white dark:bg-black border border-gray-200 dark:border-gray-800 rounded-2xl focus:ring-4 focus:ring-primary-500/10 outline-none transition-all font-black text-xs dark:text-white uppercase tracking-widest shadow-inner hover:border-primary-300 ${appUser?.plan !== PlanType.PRO ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    value={customDomain}
+                    onChange={(e) => setCustomDomain(e.target.value)}
+                    placeholder="BRAND.COM"
+                />
+                <p className="text-xs text-gray-400 font-bold uppercase tracking-tight px-2 flex items-center gap-2">
+                  <Zap className="w-3 h-3 text-yellow-500 fill-current" />
+                  Point your CNAME to our servers for instant white-labeling
+                </p>
+            </div>
+          </div>
+        )}
+
+        {activeModalTab === 'content' && (
+          <div className="animate-in fade-in slide-in-from-right-4">
+            {vaultType === VaultType.SENDING ? (
+              <div className="space-y-8">
+                {/* Asset Pipeline - Files */}
+                <div className="space-y-4">
+                  <label className="block text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] ml-1">Asset Pipeline</label>
+                  <div
+                    className={`border-2 border-dashed rounded-[2rem] p-8 text-center transition-all relative group cursor-pointer h-[240px] flex flex-col items-center justify-center ${isDragging ? 'border-primary-500 bg-primary-50 dark:bg-primary-900/20 shadow-2xl shadow-primary-500/10 scale-[1.01]' : 'border-gray-200 dark:border-gray-700 hover:bg-white dark:hover:bg-white/5 hover:border-primary-400'
+                      }`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      multiple
+                      className="hidden"
+                      onChange={handleFileSelect}
+                    />
+                    <div className="w-12 h-12 bg-primary-50 dark:bg-primary-900/40 rounded-2xl flex items-center justify-center mb-3 group-hover:scale-110 transition-transform shadow-inner">
+                      <UploadCloud className={`w-6 h-6 transition-colors ${isDragging ? 'text-primary-600' : 'text-primary-500'}`} />
+                    </div>
+                    <p className="text-sm text-gray-900 dark:text-white font-black uppercase tracking-tight">
+                      {isDragging ? 'Drop Files' : 'Upload Data'}
+                    </p>
+                    <p className="text-[10px] text-gray-400 mt-1 font-black uppercase tracking-widest leading-none">Quantum Encryption</p>
+                  </div>
+                  
+                  {/* File Listings Grid */}
+                  {(existingFiles.length > 0 || selectedFiles.length > 0) && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-h-[300px] overflow-y-auto pr-2 no-scrollbar">
+                      {/* Previously Uploaded Files (Edit Mode) */}
+                      {modalMode === 'EDIT' && existingFiles.length > 0 && (
+                        <>
+                          {existingFiles.map((f) => (
+                            <div key={f.id} className="group flex items-center justify-between text-xs bg-white dark:bg-black/40 border border-gray-100 dark:border-white/5 p-4 rounded-2xl shadow-sm hover:border-primary-500/30 transition-all">
+                              <div className="flex items-center gap-3 truncate min-w-0">
+                                <div className="w-8 h-8 bg-gray-50 dark:bg-white/5 rounded-xl flex items-center justify-center flex-shrink-0">
+                                  <FileText className="w-4 h-4 text-gray-400" />
+                                </div>
+                                <div className="truncate">
+                                  <p className="font-black text-gray-900 dark:text-white uppercase tracking-tight truncate">{f.name}</p>
+                                  <p className="text-xs text-gray-400 font-bold uppercase tracking-widest">{formatBytes(f.size)}</p>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1">
+                                <button onClick={(e) => { e.preventDefault(); e.stopPropagation(); setSelectedFileForSettings({ type: 'EXISTING', index: (f as any).id }); }} className="p-2.5 text-gray-400 hover:text-primary-500 hover:bg-primary-50 dark:hover:bg-primary-900/30 rounded-xl transition-all"><Settings2 className="w-4 h-4" /></button>
+                                <button onClick={(e) => { e.stopPropagation(); handleMarkFileDeleted(f.id); }} className="p-2.5 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-xl transition-all"><X className="w-4 h-4" /></button>
+                              </div>
+                            </div>
+                          ))}
+                        </>
+                      )}
+
+                      {/* Staged for Upload */}
+                      {selectedFiles.length > 0 && (
+                        <>
+                          {selectedFiles.map((f, i) => (
+                            <div key={i} className="group flex items-center justify-between text-xs bg-primary-500/[0.02] dark:bg-primary-500/5 border border-primary-500/10 p-4 rounded-2xl shadow-sm hover:border-primary-500/30 transition-all">
+                              <div className="flex items-center gap-3 truncate min-w-0">
+                                <div className="w-8 h-8 bg-primary-50 dark:bg-primary-900/40 rounded-xl flex items-center justify-center flex-shrink-0">
+                                  <UploadCloud className="w-4 h-4 text-primary-500" />
+                                </div>
+                                <div className="truncate">
+                                  <p className="font-black text-primary-600 dark:text-primary-400 uppercase tracking-tight truncate">{f.name}</p>
+                                  <p className="text-xs text-gray-400 font-bold uppercase tracking-widest">{formatBytes(f.size)}</p>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1">
+                                <button onClick={(e) => { e.preventDefault(); e.stopPropagation(); setSelectedFileForSettings({ type: 'NEW', index: i }); }} className="p-2.5 text-gray-400 hover:text-primary-500 hover:bg-primary-50 dark:hover:bg-primary-900/30 rounded-xl transition-all"><Settings2 className="w-4 h-4" /></button>
+                                <button onClick={(e) => { e.stopPropagation(); removeSelectedFile(i); }} className="p-2.5 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-xl transition-all"><X className="w-4 h-4" /></button>
+                              </div>
+                            </div>
+                          ))}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Redirect Network - Links */}
+                <div className="space-y-4">
+                  <label className="block text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] ml-1">Redirect Network</label>
+                  <div className="bg-white/50 dark:bg-black/40 p-8 rounded-[2rem] border border-gray-100 dark:border-gray-800 shadow-sm space-y-6">
+                    <div className="flex gap-3">
+                      <input
+                        type="url"
+                        className="flex-1 p-4 bg-white dark:bg-black border border-gray-200 dark:border-gray-700 rounded-xl focus:ring-4 focus:ring-primary-500/10 outline-none transition-all font-black text-xs dark:text-white"
+                        placeholder="HTTPS://URL..."
+                        value={tempLink}
+                        onChange={(e) => setTempLink(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && addLink()}
+                      />
+                      <button onClick={addLink} className="bg-primary-600 hover:bg-primary-700 px-6 rounded-xl font-black text-white transition-all active:scale-95 uppercase text-xs tracking-widest shadow-lg shadow-primary-500/20">Add</button>
+                    </div>
+                    
+                    {links.length > 0 ? (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[200px] overflow-y-auto pr-1 no-scrollbar">
+                        {links.map((l, i) => (
+                          <div key={i} className="flex items-center justify-between text-xs text-blue-600 dark:text-blue-400 bg-blue-500/5 p-3 rounded-xl border border-blue-500/10">
+                            <span className="flex items-center gap-3 truncate font-black uppercase tracking-tight"><LinkIcon className="w-4 h-4" /> {l}</span>
+                            <button onClick={() => removeLink(i)} className="text-gray-400 hover:text-red-500 transition-colors p-1"><X className="w-4 h-4" /></button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center justify-center opacity-25 gap-2 py-4">
+                         <LinkIcon className="w-6 h-6" />
+                         <span className="text-[10px] font-black uppercase tracking-[0.2em]">Ready for connections</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <ReceivingConfigBuilder 
+                config={receivingConfig}
+                onChange={setReceivingConfig}
+              />
+            )}
+          </div>
+        )}
+
+        {activeModalTab === 'lifecycle' && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-in fade-in slide-in-from-right-4">
+            {/* Expiry Lifetime */}
+            <div className="bg-white/50 dark:bg-white/[0.02] p-8 rounded-[2rem] border border-gray-100 dark:border-white/5 space-y-4 shadow-sm">
+              <div className="flex items-center gap-2 mb-2">
+                <Clock className="w-5 h-5 text-primary-500" />
+                <span className="text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-widest">Vault Lifetime</span>
+              </div>
+              {(() => {
+                const expiryOptions: { value: number | 'never'; label: string; planTag?: 'PLUS' | 'PRO'; disabled: boolean }[] = [
+                  { value: 24, label: '24 Hours', disabled: false },
+                  { value: 48, label: '48 Hours', planTag: 'PLUS', disabled: appUser?.plan === PlanType.FREE },
+                  { value: 72, label: '72 Hours', planTag: 'PLUS', disabled: appUser?.plan === PlanType.FREE },
+                  { value: 'never', label: 'Permanent', planTag: 'PRO', disabled: appUser?.plan !== PlanType.PRO },
+                ];
+                const selected = expiryOptions.find(o => o.value === expiryHours) || expiryOptions[0];
+                const isOpen = menuOpenId === 'modal-expiry';
+
+                return (
+                  <div className="relative space-y-3">
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); setMenuOpenId(isOpen ? null : 'modal-expiry'); }}
+                      className="w-full flex items-center justify-between px-6 py-5 rounded-2xl text-xs font-black transition-all bg-white dark:bg-black border border-gray-200 dark:border-gray-800 dark:text-white uppercase tracking-widest shadow-inner hover:border-primary-300"
+                    >
+                      {expiryHours === 'custom' ? 'Custom Hours' : selected.label}
+                      <ChevronDown className={`w-4 h-4 transition-transform duration-300 ${isOpen ? 'rotate-180 text-primary-500' : 'text-gray-400'}`} />
+                    </button>
+                    {isOpen && (
+                      <div className="absolute top-full left-0 right-0 mt-3 bg-white dark:bg-gray-900 rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 z-[100] overflow-hidden animate-in fade-in slide-in-from-top-2">
+                        {expiryOptions.map((opt) => (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            disabled={opt.disabled}
+                            onClick={() => { setExpiryHours(opt.value); setMenuOpenId(null); }}
+                            className={`w-full text-left px-6 py-4 text-xs font-black uppercase tracking-widest transition-colors flex items-center justify-between ${expiryHours === opt.value ? 'bg-primary-600 text-white' : 'hover:bg-primary-50 dark:hover:bg-white/5 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:hover:bg-transparent'}`}
+                          >
+                            <span>{opt.label}</span>
+                            {opt.planTag && (
+                              <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-widest ${opt.disabled ? 'bg-gray-100 dark:bg-gray-800 text-gray-400' : 'bg-primary-500/10 text-primary-600 dark:text-primary-400'}`}>
+                                {opt.planTag}
+                              </span>
+                            )}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          disabled={appUser?.plan !== PlanType.PRO}
+                          onClick={() => { setExpiryHours('custom'); setMenuOpenId(null); }}
+                          className={`w-full text-left px-6 py-4 text-xs font-black uppercase tracking-widest transition-colors flex items-center justify-between ${expiryHours === 'custom' ? 'bg-primary-600 text-white' : 'hover:bg-primary-50 dark:hover:bg-white/5 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:hover:bg-transparent'}`}
+                        >
+                          <span>Custom Range</span>
+                          <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-widest ${appUser?.plan !== PlanType.PRO ? 'bg-gray-100 dark:bg-gray-800 text-gray-400' : 'bg-primary-500/10 text-primary-600 dark:text-primary-400'}`}>
+                            PRO
+                          </span>
+                        </button>
+                      </div>
+                    )}
+                    {expiryHours === 'custom' && (
+                      <div className="animate-in slide-in-from-top-2 duration-300">
+                        <input
+                          type="number"
+                          placeholder="HOURS..."
+                          value={customExpiryHours}
+                          onChange={(e) => setCustomExpiryHours(e.target.value)}
+                          className="w-full px-6 py-5 bg-white dark:bg-black border border-primary-500/30 rounded-2xl font-black text-xs text-primary-600 dark:text-primary-400 outline-none shadow-inner text-center focus:ring-4 focus:ring-primary-500/10"
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* Scan Capacity */}
+            <div className="bg-white/50 dark:bg-white/[0.02] p-8 rounded-[2rem] border border-gray-100 dark:border-white/5 space-y-4 shadow-sm">
+              <div className="flex items-center gap-2 mb-2">
+                <Eye className="w-5 h-5 text-primary-500" />
+                <span className="text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-widest">Scan Capacity</span>
+              </div>
+              {(() => {
+                const scanOptions: { value: string | number; label: string; planTag?: 'PLUS' | 'PRO'; disabled: boolean }[] = [
+                  { value: 'none', label: 'Unlimited', disabled: false },
+                  { value: 25, label: '25 Scans', disabled: false },
+                  { value: 65, label: '65 Scans', planTag: 'PLUS', disabled: appUser?.plan === PlanType.FREE },
+                  { value: 125, label: '125 Scans', planTag: 'PLUS', disabled: appUser?.plan === PlanType.FREE },
+                ];
+                const currentValue = maxViews === null ? 'none' : maxViews;
+                const selected = scanOptions.find(o => o.value === currentValue) || scanOptions[1];
+                const isOpen = menuOpenId === 'modal-scans';
+
+                return (
+                  <div className="relative space-y-3">
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); setMenuOpenId(isOpen ? null : 'modal-scans'); }}
+                      className="w-full flex items-center justify-between px-6 py-5 rounded-2xl text-xs font-black transition-all bg-white dark:bg-black border border-gray-200 dark:border-gray-800 dark:text-white uppercase tracking-widest shadow-inner hover:border-primary-300"
+                    >
+                      {maxViews === 'custom' ? 'Custom Limit' : selected.label}
+                      <ChevronDown className={`w-4 h-4 transition-transform duration-300 ${isOpen ? 'rotate-180 text-primary-500' : 'text-gray-400'}`} />
+                    </button>
+                    {isOpen && (
+                      <div className="absolute top-full left-0 right-0 mt-3 bg-white dark:bg-gray-900 rounded-2xl shadow-2xl border border-gray-100 dark:border-gray-800 z-[100] overflow-hidden animate-in fade-in slide-in-from-top-2">
+                        {scanOptions.map((opt) => (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            disabled={opt.disabled}
+                            onClick={() => { setMaxViews(opt.value === 'none' ? null : Number(opt.value)); setMenuOpenId(null); }}
+                            className={`w-full text-left px-6 py-4 text-xs font-black uppercase tracking-widest transition-colors flex items-center justify-between ${currentValue === opt.value ? 'bg-primary-600 text-white' : 'hover:bg-primary-50 dark:hover:bg-white/5 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:hover:bg-transparent'}`}
+                          >
+                            <span>{opt.label}</span>
+                            {opt.planTag && (
+                              <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-widest ${opt.disabled ? 'bg-gray-100 dark:bg-gray-800 text-gray-400' : 'bg-primary-500/10 text-primary-600 dark:text-primary-400'}`}>
+                                {opt.planTag}
+                              </span>
+                            )}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          disabled={appUser?.plan !== PlanType.PRO}
+                          onClick={() => { setMaxViews('custom'); setMenuOpenId(null); }}
+                          className={`w-full text-left px-6 py-4 text-xs font-black uppercase tracking-widest transition-colors flex items-center justify-between ${maxViews === 'custom' ? 'bg-primary-600 text-white' : 'hover:bg-primary-50 dark:hover:bg-white/5 text-gray-500 dark:text-gray-400 disabled:opacity-30 disabled:hover:bg-transparent'}`}
+                        >
+                          <span>Custom Limit</span>
+                          <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-widest ${appUser?.plan !== PlanType.PRO ? 'bg-gray-100 dark:bg-gray-800 text-gray-400' : 'bg-primary-500/10 text-primary-600 dark:text-primary-400'}`}>
+                            PRO
+                          </span>
+                        </button>
+                      </div>
+                    )}
+                    {maxViews === 'custom' && (
+                      <div className="animate-in slide-in-from-top-2 duration-300">
+                        <input
+                          type="number"
+                          value={customMaxViews}
+                          onChange={(e) => setCustomMaxViews(e.target.value)}
+                          placeholder="MAX SCANS..."
+                          className="w-full px-6 py-5 bg-white dark:bg-black border border-primary-500/30 rounded-2xl font-black text-xs text-primary-600 dark:text-primary-400 outline-none shadow-inner text-center focus:ring-4 focus:ring-primary-500/10"
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        )}
+
+        {activeModalTab === 'security' && (
+          <div className="space-y-8 animate-in fade-in slide-in-from-right-4">
+            {/* Security Protocol - Main Input */}
+            <div className="bg-gray-50/50 dark:bg-white/[0.02] p-6 sm:p-10 rounded-[2.5rem] border border-gray-100 dark:border-white/5 space-y-8">
+              <div className="flex items-center gap-4">
+                <div className="p-3 bg-primary-500/10 text-primary-600 dark:text-primary-400 rounded-2xl">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black text-gray-900 dark:text-white uppercase tracking-[0.2em] leading-none mb-1">Security Protocol</h3>
+                  <p className="text-xs text-gray-400 font-bold uppercase tracking-widest">End-to-End Vault Shielding</p>
+                </div>
+              </div>
+
+              <div className="relative group">
+                <input
+                  type="password"
+                  disabled={appUser?.plan !== PlanType.PRO}
+                  value={vaultPassword}
+                  onChange={(e) => setVaultPassword(e.target.value)}
+                  placeholder={appUser?.plan === PlanType.PRO ? "SET ACCESS PASSCODE..." : "PRO PLAN REQUIRED"}
+                  className={`w-full py-6 pl-16 pr-8 border rounded-[1.5rem] transition-all font-black text-sm tracking-[0.3em] shadow-inner ${appUser?.plan === PlanType.PRO
+                    ? 'bg-white dark:bg-black border-gray-200 dark:border-gray-800 focus:ring-8 focus:ring-primary-500/5 dark:text-white hover:border-primary-400 dark:hover:border-primary-600'
+                    : 'bg-gray-100 dark:bg-gray-800 border-gray-200 dark:border-gray-800 cursor-not-allowed opacity-50'
+                    }`}
+                />
+                <ShieldCheck className={`absolute left-6 top-1/2 -translate-y-1/2 w-6 h-6 ${appUser?.plan === PlanType.PRO ? 'text-primary-500 animate-pulse' : 'text-gray-400'}`} />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 border-t border-gray-100 dark:border-gray-800/50">
+                <div className="flex items-start gap-3 p-4 rounded-2xl bg-white/50 dark:bg-black/20">
+                   <Lock className="w-4 h-4 text-emerald-500 mt-0.5" />
+                   <p className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase leading-relaxed tracking-wider">
+                     AES-256 military-grade encryption applied automatically
+                   </p>
+                </div>
+                <div className="flex items-start gap-3 p-4 rounded-2xl bg-white/50 dark:bg-black/20">
+                   <Zap className="w-4 h-4 text-amber-500 mt-0.5" />
+                   <p className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase leading-relaxed tracking-wider">
+                     Real-time threat monitoring enabled for this vault
+                   </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Access Level Section */}
+            <div className="bg-gray-50/50 dark:bg-white/[0.02] p-8 rounded-[2rem] border border-gray-100 dark:border-white/5 space-y-6">
+               <div className="flex items-center gap-3">
+                  <div className="p-2.5 bg-gray-900 dark:bg-white text-white dark:text-black rounded-xl">
+                    <Users className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs font-black text-gray-900 dark:text-white uppercase tracking-[0.2em] leading-none mb-1">Access Control</h3>
+                    <p className="text-xs text-gray-400 font-bold uppercase tracking-widest">Visibility Permissions</p>
+                  </div>
+                </div>
+               <div className="flex flex-col sm:flex-row gap-4">
+                <button
+                  type="button"
+                  onClick={() => setAccessLevel(AccessLevel.PUBLIC)}
+                  className={`flex-1 py-5 px-6 rounded-2xl border-2 transition-all flex items-center justify-center gap-3 shadow-sm ${accessLevel === AccessLevel.PUBLIC ? 'border-primary-500 bg-primary-500/10 text-primary-600 dark:text-primary-400' : 'border-gray-200 dark:border-gray-800 bg-white dark:bg-black opacity-60 text-gray-500'}`}
+                >
+                  <Globe className="w-4 h-4" />
+                  <span className="text-xs font-black uppercase tracking-widest">Public Access</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAccessLevel(AccessLevel.RESTRICTED)}
+                  className={`flex-1 py-5 px-6 rounded-2xl border-2 transition-all flex items-center justify-center gap-3 shadow-sm ${accessLevel === AccessLevel.RESTRICTED ? 'border-primary-500 bg-primary-500/10 text-primary-600 dark:text-primary-400' : 'border-gray-200 dark:border-gray-800 bg-white dark:bg-black opacity-60 text-gray-500'}`}
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  <span className="text-xs font-black uppercase tracking-widest">By Request</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeModalTab === 'design' && (
+          <div className="animate-in fade-in slide-in-from-right-4 duration-300">
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+              
+              {/* Left Column: Customization Controls */}
+              <div className="lg:col-span-7 space-y-8">
+                
+                {/* Header Info */}
+                <div className="flex items-center gap-4 mb-2">
+                  <div className="w-12 h-12 bg-gradient-to-br from-violet-500 to-indigo-600 text-white rounded-2xl flex items-center justify-center shadow-lg shadow-violet-500/20">
+                    <QrCode className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-black text-gray-900 dark:text-white uppercase tracking-tight italic">Visual Identity</h3>
+                    <p className="text-xs font-black text-primary-600 dark:text-primary-400 uppercase tracking-[0.2em] mt-1">Design Framework & Branding</p>
+                  </div>
+                </div>
+                {/* Branding Palette */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">Branding Palette</h4>
+                  <div className="grid grid-cols-6 gap-3">
+                    {[
+                      { color: '#000000', label: 'Classic' },
+                      { color: '#7c3aed', label: 'Primary' },
+                      { color: '#2563eb', label: 'Royal' },
+                      { color: '#059669', label: 'Emerald' },
+                      { color: '#dc2626', label: 'Crimson' },
+                      { color: '#ea580c', label: 'Orange' }
+                    ].map((c) => (
+                      <button
+                        key={c.color}
+                        type="button"
+                        onClick={() => setSelectedQrColor(c.color)}
+                        className={`w-full aspect-square rounded-2xl border-4 transition-all duration-300 relative group flex items-center justify-center hover:scale-105 active:scale-95 ${selectedQrColor === c.color ? 'border-primary-500 shadow-md shadow-primary-500/25 scale-105' : 'border-transparent opacity-80 hover:opacity-100'}`}
+                        style={{ backgroundColor: c.color }}
+                        title={c.label}
+                      >
+                        {selectedQrColor === c.color && (
+                          <div className="w-2.5 h-2.5 bg-white dark:bg-black rounded-full shadow" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Central Logo Overlay */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">Central Logo Overlay</h4>
+                  
+                  <div 
+                    onClick={() => qrLogoInputRef.current?.click()}
+                    className={`group/dropzone border-2 border-dashed rounded-3xl p-8 flex flex-col items-center justify-center gap-4 cursor-pointer transition-all duration-300 text-center ${
+                      qrLogo 
+                        ? 'border-primary-500 bg-primary-50/50 dark:bg-primary-950/10' 
+                        : 'border-gray-200 dark:border-white/10 hover:border-primary-400 hover:bg-gray-50 dark:hover:bg-white/5'
+                    }`}
+                  >
+                    <input type="file" ref={qrLogoInputRef} hidden accept="image/*" onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) {
+                        const reader = new FileReader();
+                        reader.onloadend = () => setQrLogo(reader.result as string);
+                        reader.readAsDataURL(file);
+                      }
+                    }} />
+
+                    {qrLogo ? (
+                      <div className="relative">
+                        <div className="w-20 h-20 bg-white dark:bg-gray-900 rounded-2xl flex items-center justify-center overflow-hidden border border-gray-150 dark:border-white/10 shadow-lg relative z-10 animate-in zoom-in-95">
+                          <img src={qrLogo} className="w-full h-full object-cover" />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setQrLogo(null);
+                          }}
+                          className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1.5 shadow-md hover:bg-red-600 transition-all active:scale-90 z-20 flex items-center justify-center"
+                          title="Remove logo"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="w-16 h-16 rounded-2xl bg-gray-50 dark:bg-white/5 flex items-center justify-center text-gray-400 dark:text-gray-600 group-hover/dropzone:text-primary-500 transition-all shadow-inner">
+                        <Box className="w-6 h-6" />
+                      </div>
+                    )}
+
+                    <div>
+                      <p className="text-xs font-black text-gray-900 dark:text-white uppercase tracking-[0.15em] mb-1">
+                        {qrLogo ? 'Logo Loaded' : 'Upload Central Emblem'}
+                      </p>
+                      <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">
+                        SVG, PNG, or JPG Supported
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Right Column: Live QR Preview Panel */}
+              <div className="lg:col-span-5">
+                <div className="bg-gradient-to-br from-gray-50/80 to-white dark:from-[#0d0f14] dark:to-[#0a0a0d] rounded-[2.5rem] border border-gray-200/50 dark:border-white/5 p-8 flex flex-col items-center justify-center relative overflow-hidden group shadow-xl hover:shadow-2xl transition-all duration-500">
+                  {/* Subtle color background glow */}
+                  <div 
+                    className="absolute -right-20 -top-20 w-60 h-60 rounded-full blur-[80px] opacity-10 dark:opacity-20 transition-all duration-700" 
+                    style={{ backgroundColor: selectedQrColor }} 
+                  />
+                  <div 
+                    className="absolute -left-20 -bottom-20 w-60 h-60 rounded-full blur-[80px] opacity-10 dark:opacity-20 transition-all duration-700" 
+                    style={{ backgroundColor: selectedQrColor }} 
+                  />
+
+                  <span className="text-[9px] font-black uppercase tracking-[0.25em] text-gray-400 dark:text-gray-500 mb-6">Real-time QR Preview</span>
+
+                  {/* QR Core Container */}
+                  <div className="w-52 h-52 bg-white dark:bg-black rounded-3xl p-5 border border-gray-150 dark:border-white/10 shadow-inner flex items-center justify-center relative">
+                    <svg viewBox="0 0 100 100" className="w-full h-full">
+                      {/* Finder Pattern: Top-Left */}
+                      <rect x="0" y="0" width="28" height="28" rx={selectedQrDesign === 'dots' ? '14' : selectedQrDesign === 'smooth' ? '10' : '4'} fill={selectedQrColor} />
+                      <rect x="4" y="4" width="20" height="20" rx={selectedQrDesign === 'dots' ? '10' : selectedQrDesign === 'smooth' ? '7' : '2'} fill="#ffffff" className="dark:fill-[#000000]" />
+                      <rect x="8" y="8" width="12" height="12" rx={selectedQrDesign === 'dots' ? '6' : selectedQrDesign === 'smooth' ? '4' : '1'} fill={selectedQrColor} />
+
+                      {/* Finder Pattern: Top-Right */}
+                      <rect x="72" y="0" width="28" height="28" rx={selectedQrDesign === 'dots' ? '14' : selectedQrDesign === 'smooth' ? '10' : '4'} fill={selectedQrColor} />
+                      <rect x="76" y="4" width="20" height="20" rx={selectedQrDesign === 'dots' ? '10' : selectedQrDesign === 'smooth' ? '7' : '2'} fill="#ffffff" className="dark:fill-[#000000]" />
+                      <rect x="80" y="8" width="12" height="12" rx={selectedQrDesign === 'dots' ? '6' : selectedQrDesign === 'smooth' ? '4' : '1'} fill={selectedQrColor} />
+
+                      {/* Finder Pattern: Bottom-Left */}
+                      <rect x="0" y="72" width="28" height="28" rx={selectedQrDesign === 'dots' ? '14' : selectedQrDesign === 'smooth' ? '10' : '4'} fill={selectedQrColor} />
+                      <rect x="4" y="76" width="20" height="20" rx={selectedQrDesign === 'dots' ? '10' : selectedQrDesign === 'smooth' ? '7' : '2'} fill="#ffffff" className="dark:fill-[#000000]" />
+                      <rect x="8" y="80" width="12" height="12" rx={selectedQrDesign === 'dots' ? '6' : selectedQrDesign === 'smooth' ? '4' : '1'} fill={selectedQrColor} />
+
+                      {/* QR Data Dots - Realistic Matrix */}
+                      <g fill={selectedQrColor} opacity="0.85">
+                        {Array.from({ length: 25 }).map((_, colIndex) => {
+                          const x = colIndex * 4;
+                          return Array.from({ length: 25 }).map((_, rowIndex) => {
+                            const y = rowIndex * 4;
+                            
+                            // Skip Finder Patterns
+                            if (x < 28 && y < 28) return null;
+                            if (x >= 72 && y < 28) return null;
+                            if (x < 28 && y >= 72) return null;
+                            
+                            // Skip Center Cutout
+                            if (x >= 32 && x < 68 && y >= 32 && y < 68) return null;
+
+                            // Skip Timing Patterns (standard QR structure lookup)
+                            if (x === 24 && y > 28 && y < 72) return null;
+                            if (y === 24 && x > 28 && x < 72) return null;
+
+                            // Pseudo-random data encoding structure
+                            const seed = (colIndex * 17 + rowIndex * 43) % 10;
+                            if (seed < 2) return null; // ~20% realistic spacing holes
+
+                            return (
+                              <rect
+                                key={`${colIndex}-${rowIndex}`}
+                                x={x + 0.5}
+                                y={y + 0.5}
+                                width="3"
+                                height="3"
+                                rx={selectedQrDesign === 'dots' ? '1.5' : selectedQrDesign === 'smooth' ? '1' : '0'}
+                              />
+                            );
+                          });
+                        })}
+                      </g>
+
+                      {/* Cutout center block */}
+                      <rect x="34" y="34" width="32" height="32" rx="8" fill="#ffffff" className="dark:fill-[#000000]" />
+                    </svg>
+
+                    {/* Logo Overlay */}
+                    <div className="absolute w-12 h-12 bg-white dark:bg-[#0d0f14] rounded-xl border border-gray-150 dark:border-white/5 flex items-center justify-center overflow-hidden shadow-md">
+                      {qrLogo ? (
+                        <img src={qrLogo} className="w-full h-full object-cover" />
+                      ) : (
+                        <span className="text-xs font-black uppercase tracking-wider text-center" style={{ color: selectedQrColor }}>
+                          {vaultName.trim() ? vaultName.trim().slice(0, 2).toUpperCase() : 'QR'}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Metadata preview label */}
+                  <div className="mt-6 text-center w-full">
+                    <span className="text-sm font-black text-gray-900 dark:text-white uppercase tracking-wider block max-w-[200px] mx-auto truncate">
+                      {vaultName.trim() || 'UNNAMED VAULT'}
+                    </span>
+                    <span className="text-[10px] text-gray-400 dark:text-gray-500 font-black uppercase tracking-widest mt-1 block">
+                      Color: {selectedQrColor} • Style: {selectedQrDesign}
+                    </span>
+                  </div>
+
+                </div>
+              </div>
+
+              {/* Design Framework - Full Width Bottom Section */}
+              <div className="lg:col-span-12 pt-8 border-t border-gray-100 dark:border-white/5 mt-4">
+                <div className="space-y-4">
+                  <h4 className="text-xs font-black text-gray-450 dark:text-gray-500 uppercase tracking-[0.2em]">Design Framework</h4>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-6">
+                    {[
+                      { id: 'standard', label: 'Classic Square', icon: Grid },
+                      { id: 'dots', label: 'Quantum Dots', icon: Settings },
+                      { id: 'squares', label: 'Modern Block', icon: Box },
+                      { id: 'smooth', label: 'Liquid Smooth', icon: Zap }
+                    ].map((design) => {
+                      const DesignIcon = design.icon;
+                      const isActive = selectedQrDesign === design.id;
+                      return (
+                        <button
+                          key={design.id}
+                          type="button"
+                          onClick={() => setSelectedQrDesign(design.id)}
+                          className={`w-full p-6 rounded-[2rem] border-2 transition-all flex flex-col items-center gap-4 text-center active:scale-95 ${isActive ? 'border-primary-500 bg-primary-100/50 dark:bg-primary-900/20 text-primary-600 dark:text-primary-400 shadow-md shadow-primary-500/5 font-black scale-[1.02]' : 'border-gray-200 dark:border-white/5 bg-white dark:bg-black/45 text-gray-400 hover:border-primary-300'}`}
+                        >
+                          <div className={`p-3 rounded-2xl transition-all duration-300 ${isActive ? 'bg-primary-500 text-white' : 'bg-gray-100 dark:bg-gray-900 text-gray-500 dark:text-gray-400'}`}>
+                            <DesignIcon className="w-6 h-6" />
+                          </div>
+                          <span className="text-xs font-black uppercase tracking-widest mt-1">{design.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        )}
+      </>
+    );
+  };
+
+  if (isLoading) return <DashboardSkeleton />;
+  if (!isAuthenticated && !isLoading) return null; // Wait for redirect
+  if (!appUser) return null; // Wait for load
+
+  if (isModalOpen && modalMode === 'CREATE') {
+    const steps = [
+      { id: 'identity', label: 'Identity', icon: Globe },
+      { id: 'content', label: 'Content', icon: Grid },
+      { id: 'lifecycle', label: 'Lifecycle', icon: Clock },
+      { id: 'security', label: 'Security', icon: Shield },
+      { id: 'design', label: 'Design', icon: Settings2 }
+    ];
+    const stepOrder: ('identity' | 'content' | 'lifecycle' | 'security' | 'design')[] = ['identity', 'content', 'lifecycle', 'security', 'design'];
+    const currentStepIndex = stepOrder.indexOf(activeModalTab);
+
+    const handleNextStep = () => {
+      if (currentStepIndex < stepOrder.length - 1) {
+        setActiveModalTab(stepOrder[currentStepIndex + 1]);
+      }
+    };
+    const handlePrevStep = () => {
+      if (currentStepIndex > 0) {
+        setActiveModalTab(stepOrder[currentStepIndex - 1]);
+      }
+    };
+
+    return (
+      <div className="bg-gray-50 dark:bg-[#0a0a0a] min-h-screen py-6 sm:py-12 transition-colors duration-300">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+          
+          {/* Header */}
+          <div className="flex items-center justify-between mb-8 sm:mb-10">
+            <button
+              onClick={() => setIsModalOpen(false)}
+              className="flex items-center gap-2 text-xs font-black uppercase tracking-widest text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white transition-colors"
+            >
+              <ArrowLeft className="w-4 h-4" /> Exit to Dashboard
+            </button>
+            <div className="bg-primary-500/10 text-primary-600 dark:text-primary-400 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest">
+              Creating QR Vault
+            </div>
+          </div>
+
+          {/* Stepper with count */}
+          <div className="mb-10 sm:mb-12">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <span className="text-[10px] font-black uppercase tracking-widest text-primary-600 dark:text-primary-400 font-bold">Step {currentStepIndex + 1} of 5</span>
+                <h1 className="text-xl sm:text-3xl font-black text-gray-900 dark:text-white mt-1 uppercase tracking-tight">
+                  {activeModalTab === 'identity' && 'Configure Vault Identity'}
+                  {activeModalTab === 'content' && 'Upload Content & Assets'}
+                  {activeModalTab === 'lifecycle' && 'Define Vault Lifecycle'}
+                  {activeModalTab === 'security' && 'Deploy Security Protocols'}
+                  {activeModalTab === 'design' && 'Personalize QR Design'}
+                </h1>
+              </div>
+            </div>
+
+            {/* Step indicators */}
+            <div className="relative flex justify-between items-center w-full mt-8">
+              {/* Connection line */}
+              <div className="absolute top-[22px] left-[22px] right-[22px] h-0.5 z-0">
+                <div className="absolute inset-0 bg-gray-200 dark:bg-gray-800" />
+                <div 
+                  className="absolute top-0 left-0 h-full bg-primary-500 transition-all duration-500" 
+                  style={{ width: `${(currentStepIndex / (stepOrder.length - 1)) * 100}%` }}
+                />
+              </div>
+
+              {steps.map((step, idx) => {
+                const isCompleted = idx < currentStepIndex;
+                const isActive = idx === currentStepIndex;
+                const StepIcon = step.icon;
+
+                return (
+                  <button
+                    key={step.id}
+                    onClick={() => {
+                      if (idx <= currentStepIndex || Object.keys(fileSettings).length > 0 || vaultName.trim() !== '') {
+                        setActiveModalTab(step.id as any);
+                      }
+                    }}
+                    className="relative z-10 flex flex-col items-center group focus:outline-none"
+                  >
+                    <div className={`w-11 h-11 rounded-full flex items-center justify-center border-2 transition-all duration-500 ${
+                      isCompleted 
+                        ? 'bg-primary-600 border-primary-600 text-white shadow-lg shadow-primary-500/20' 
+                        : isActive 
+                          ? 'bg-white dark:bg-gray-900 border-primary-500 text-primary-600 dark:text-primary-400 shadow-xl shadow-primary-500/10 scale-110 ring-4 ring-primary-500/10' 
+                          : 'bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-800 text-gray-400 group-hover:border-gray-300 dark:group-hover:border-gray-700'
+                    }`}>
+                      {isCompleted ? (
+                        <Check className="w-4 h-4" />
+                      ) : (
+                        <StepIcon className="w-4 h-4" />
+                      )}
+                    </div>
+                    <span className={`text-[9px] font-black uppercase tracking-widest mt-2 transition-colors hidden sm:block ${
+                      isActive 
+                        ? 'text-primary-600 dark:text-primary-400' 
+                        : isCompleted 
+                          ? 'text-gray-900 dark:text-gray-200' 
+                          : 'text-gray-400 dark:text-gray-500'
+                    }`}>
+                      {step.label}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Form Content Card */}
+          <div className="bg-white dark:bg-gray-900 rounded-3xl p-5 sm:p-10 border border-gray-100 dark:border-gray-800 shadow-xl space-y-12 mb-8 min-h-[400px]">
+            {renderFormContent()}
+          </div>
+
+          {/* Uploading progress card when submitting */}
+          {isSubmitting && (
+            <div className="mb-8 p-6 bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-3xl animate-in slide-in-from-bottom-4 duration-500 shadow-xl">
+              <div className="flex items-center justify-between mb-6">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 bg-primary-500/10 rounded-xl flex items-center justify-center">
+                    <Loader2 className="w-4 h-4 text-primary-500 animate-spin" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-black text-gray-900 dark:text-white uppercase tracking-widest leading-none mb-1">Transmission Pipeline</h4>
+                    <p className="text-xs text-gray-400 font-bold uppercase tracking-widest">Active Data Stream</p>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <span className="text-xl font-black text-primary-600 dark:text-primary-400 leading-none">{uploadProgress}%</span>
+                  {estimatedSeconds > 0 && (
+                    <p className="text-xs text-gray-400 font-black uppercase tracking-[0.2em] mt-1">ETA: {estimatedSeconds}s</p>
+                  )}
+                </div>
+              </div>
+
+
+
+              <div className="w-full bg-gray-100 dark:bg-gray-800 h-1.5 rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-primary-500 shadow-[0_0_15px_rgba(var(--primary-rgb),0.5)] transition-all duration-700 ease-out relative"
+                  style={{ width: `${uploadProgress}%` }}
+                >
+                  <div className="absolute inset-0 bg-white/20 animate-pulse" />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Stepper Footer Controls */}
+          <div className="flex items-center justify-between p-4 sm:p-6 bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-3xl shadow-lg">
+            <button
+              onClick={currentStepIndex === 0 ? () => setIsModalOpen(false) : handlePrevStep}
+              disabled={isSubmitting}
+              className="px-4 sm:px-6 py-3 text-xs font-black text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-white transition-colors uppercase tracking-widest flex items-center gap-2"
+            >
+              {currentStepIndex === 0 ? 'Cancel' : 'Back'}
+            </button>
+            
+            {currentStepIndex === stepOrder.length - 1 ? (
+              <button
+                onClick={handleSubmit}
+                disabled={isSubmitting}
+                className="bg-primary-600 hover:bg-primary-700 text-white px-6 sm:px-8 py-3 rounded-xl font-black text-xs shadow-xl shadow-primary-500/20 active:scale-95 transition-all flex items-center gap-2 uppercase tracking-widest"
+              >
+                {isSubmitting ? <Loader2 className="animate-spin w-4 h-4" /> : 'Create Vault'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleNextStep}
+                className="bg-primary-600 hover:bg-primary-700 text-white px-6 sm:px-8 py-3 rounded-xl font-black text-xs shadow-xl shadow-primary-500/20 active:scale-95 transition-all flex items-center gap-2 uppercase tracking-widest"
+              >
+                Next Step
+              </button>
+            )}
+          </div>
+
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-gray-50 dark:bg-[#0a0a0a] min-h-screen pb-12 relative transition-colors duration-300">
+
+      {/* Over Limit Banner */}
+      {isOverLimit && (
+        <div className="bg-red-50 border-b border-red-200 sticky top-26 z-40 animate-in slide-in-from-top duration-300">
+          <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-3 text-red-700">
+              <Lock className="w-5 h-5" />
+              <span className="font-medium">Storage Limit Reached.</span>
+              <span className="text-sm">Your data is secure just explore and buy subscription to continue. You cannot add or delete files.</span>
+            </div>
+            <Link to="/pricing" className="bg-red-600 text-white px-4 py-1.5 rounded-lg text-sm font-bold shadow-sm hover:bg-red-700 transition-colors">
+              Upgrade Now
+            </Link>
+          </div>
+        </div>
+      )}
+
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+
+        {/* Welcome & Stats */}
+        <StatGrid
+          appUser={appUser}
+          storageUsedDisplay={storageUsedDisplay}
+          isOverLimit={isOverLimit}
+          timeLeft={timeLeft}
+          googleTokens={googleTokens}
+          needsDriveConnection={needsDriveConnection}
+          handleConnectGoogleDrive={handleConnectGoogleDrive}
+          openCreateModal={openCreateModal}
+          invoices={invoices}
+          downloadInvoice={downloadInvoice}
+          formatBytes={formatBytes}
+          colors={COLORS}
+          onCancelClick={() => setShowCancelModal(true)}
+        />
+
+        <CancelSubscriptionModal
+          isOpen={showCancelModal}
+          onClose={() => setShowCancelModal(false)}
+          userId={appUser.id}
+          userEmail={appUser.email}
+          onCancelSuccess={() => loadData(appUser.id)}
+        />
+
+        {/* Google Drive Folders Section (if connected) */}
+        {googleTokens && (
+          <div className="bg-white dark:bg-gray-900 p-6 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm mb-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3">
+                <div className="bg-blue-50 dark:bg-blue-900/30 p-2 rounded-xl">
+                  <GoogleDriveImg className="w-6 h-6" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-bold text-gray-900 dark:text-white">Google Drive</h2>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">Folders synced from your connected Drive</p>
+                </div>
+              </div>
+              <button
+                onClick={() => fetchGoogleDriveFiles(googleTokens)}
+                disabled={isFetchingDrive}
+                className="text-primary-600 hover:text-primary-700 text-sm font-medium flex items-center gap-1"
+              >
+                {isFetchingDrive ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowUpDown className="w-4 h-4" />}
+                Refresh
+              </button>
+            </div>
+
+            {isFetchingDrive ? (
+              <div className="flex flex-col items-center justify-center py-12 text-gray-400 dark:text-gray-500">
+                <Loader2 className="w-8 h-8 animate-spin mb-2" />
+                <p className="text-sm">Fetching folders...</p>
+              </div>
+            ) : googleDriveFiles.length === 0 ? (
+              <div className="text-center py-12 bg-gray-50 dark:bg-[#0a0a0a] rounded-xl border border-dashed border-gray-200 dark:border-gray-800">
+                <p className="text-sm text-gray-500 dark:text-gray-400">No folders found. Create a vault to auto-sync to Drive.</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                {googleDriveFiles.map(file => (
+                  <a
+                    key={file.id}
+                    href={file.webViewLink}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="group p-4 bg-gray-50 dark:bg-gray-800/50 hover:bg-amber-50 dark:hover:bg-amber-900/20 hover:shadow-md border border-transparent hover:border-amber-200 dark:hover:border-amber-900/40 rounded-xl transition-all duration-200 flex flex-col items-center text-center cursor-pointer"
+                  >
+                    <svg className="w-12 h-12 mb-3 text-amber-400 group-hover:text-amber-500 transition-colors drop-shadow-sm" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <path d="M4 10C4 7.79086 5.79086 6 8 6H18.3431C19.404 6 20.4214 6.42143 21.1716 7.17157L23 9H40C42.2091 9 44 10.7909 44 13V38C44 40.2091 42.2091 42 40 42H8C5.79086 42 4 40.2091 4 38V10Z" fill="currentColor" />
+                      <path d="M4 14H44V38C44 40.2091 42.2091 42 40 42H8C5.79086 42 4 40.2091 4 38V14Z" fill="currentColor" opacity="0.85" />
+                    </svg>
+                    <span className="text-sm font-medium text-gray-700 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white truncate w-full">{file.name}</span>
+                    <span className="text-xs text-gray-400 dark:text-gray-500 mt-1 uppercase tracking-wider">Folder</span>
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Tools Bar (Search & Filter) */}
+        <div className="bg-white dark:bg-[#0a0a0b] p-5 rounded-[2rem] border border-gray-100 dark:border-white/5 shadow-2xl shadow-gray-200/50 dark:shadow-none mb-10 flex flex-col lg:flex-row gap-6 items-center justify-between animate-in fade-in slide-in-from-top-4 duration-500">
+          {/* Search */}
+          <div className="relative w-full md:w-96 group">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500 group-focus-within:text-primary-500 transition-colors w-5 h-5" />
+            <input
+              type="text"
+              placeholder="Search vaults..."
+              className="w-full pl-10 pr-4 py-3 bg-gray-50 dark:bg-black border border-transparent hover:bg-white dark:hover:bg-gray-800/50 hover:border-gray-200 dark:hover:border-gray-800 focus:bg-white dark:focus:bg-[#0d0f14] focus:border-primary-500 focus:ring-4 focus:ring-primary-500/10 rounded-xl text-sm dark:text-white outline-none transition-all duration-200"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+            />
+          </div>
+
+          <div className="flex w-full lg:w-auto gap-3 flex-wrap md:flex-nowrap">
+            {/* Time Filter - Custom Dropdown */}
+            {(() => {
+              const filterOptions: { value: FilterTime; label: string; dot: string }[] = [
+                { value: 'all', label: 'All Time', dot: 'bg-emerald-400' },
+                { value: '10-days', label: 'Past 10 Days', dot: 'bg-amber-400' },
+                { value: '30-days', label: 'Past 30 Days', dot: 'bg-blue-400' },
+              ];
+              const selectedFilter = filterOptions.find(o => o.value === filterTime)!;
+              return (
+                <div className="relative w-full md:w-auto md:min-w-[170px]">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setMenuOpenId(menuOpenId === 'filter-time' ? null : 'filter-time'); }}
+                    className={`w-full flex items-center gap-2.5 pl-4 pr-3 py-3.5 rounded-2xl text-xs font-black uppercase tracking-widest cursor-pointer transition-all duration-300 border ${menuOpenId === 'filter-time'
+                      ? 'bg-primary-600 border-primary-600 text-white shadow-xl shadow-primary-500/20'
+                      : 'bg-gray-50 dark:bg-black border-transparent hover:border-gray-200 dark:hover:border-gray-800 text-gray-500 dark:text-gray-400 hover:bg-white dark:hover:bg-white/5'
+                      }`}
+                  >
+                    <Filter className={`w-4 h-4 transition-colors ${menuOpenId === 'filter-time' ? 'text-white' : 'text-gray-400 dark:text-gray-500'}`} />
+                    <div className={`w-2 h-2 rounded-full ${selectedFilter.dot}`} />
+                    <span className="flex-1 text-left">{selectedFilter.label}</span>
+                    <ChevronDown className={`w-4 h-4 transition-all duration-200 ${menuOpenId === 'filter-time' ? 'rotate-180 text-white' : 'text-gray-400 dark:text-gray-500'}`} />
+                  </button>
+                  {menuOpenId === 'filter-time' && (
+                    <div className="absolute top-full left-0 right-0 mt-2 bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-100 dark:border-gray-800 z-50 overflow-hidden ring-1 ring-black/5 animate-in fade-in slide-in-from-top-2 duration-150">
+                      <div className="p-1.5">
+                        {filterOptions.map((option) => (
+                          <button
+                            key={option.value}
+                            onClick={(e) => { e.stopPropagation(); setFilterTime(option.value); setMenuOpenId(null); }}
+                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm transition-all duration-150 ${filterTime === option.value
+                              ? 'bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400 font-semibold'
+                              : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 font-medium'
+                              }`}
+                          >
+                            <div className={`w-2 h-2 rounded-full ${option.dot} ${filterTime === option.value ? 'ring-2 ring-offset-1 ring-primary-300 dark:ring-primary-900' : ''}`} />
+                            <span className="flex-1 text-left">{option.label}</span>
+                            {filterTime === option.value && <Check className="w-4 h-4 text-primary-500" />}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Sort Filter - Custom Dropdown */}
+            {(() => {
+              const sortOptions: { value: SortOption; label: string }[] = [
+                { value: 'date-newest', label: 'Newest First' },
+                { value: 'date-oldest', label: 'Oldest First' },
+                { value: 'name-asc', label: 'Name (A-Z)' },
+                { value: 'name-desc', label: 'Name (Z-A)' },
+                { value: 'size-desc', label: 'Largest Files' },
+                { value: 'size-asc', label: 'Smallest Files' },
+              ];
+              const selectedSort = sortOptions.find(o => o.value === sortOption)!;
+              return (
+                <div className="relative w-full md:w-auto md:min-w-[190px]">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setMenuOpenId(menuOpenId === 'filter-sort' ? null : 'filter-sort'); }}
+                    className={`w-full flex items-center gap-2.5 pl-4 pr-3 py-3.5 rounded-2xl text-xs font-black uppercase tracking-widest cursor-pointer transition-all duration-300 border ${menuOpenId === 'filter-sort'
+                      ? 'bg-primary-600 border-primary-600 text-white shadow-xl shadow-primary-500/20'
+                      : 'bg-gray-50 dark:bg-black border-transparent hover:border-gray-200 dark:hover:border-gray-800 text-gray-500 dark:text-gray-400 hover:bg-white dark:hover:bg-white/5'
+                      }`}
+                  >
+                    <ArrowUpDown className={`w-4 h-4 transition-colors ${menuOpenId === 'filter-sort' ? 'text-white' : 'text-gray-400 dark:text-gray-500'}`} />
+                    <span className="flex-1 text-left">{selectedSort.label}</span>
+                    <ChevronDown className={`w-4 h-4 transition-all duration-200 ${menuOpenId === 'filter-sort' ? 'rotate-180 text-white' : 'text-gray-400 dark:text-gray-500'}`} />
+                  </button>
+                  {menuOpenId === 'filter-sort' && (
+                    <div className="absolute top-full left-0 right-0 mt-2 bg-white dark:bg-gray-900 rounded-xl shadow-xl border border-gray-100 dark:border-gray-800 z-50 overflow-hidden ring-1 ring-black/5 animate-in fade-in slide-in-from-top-2 duration-150">
+                      <div className="p-1.5">
+                        {sortOptions.map((option) => (
+                          <button
+                            key={option.value}
+                            onClick={(e) => { e.stopPropagation(); setSortOption(option.value); setMenuOpenId(null); }}
+                            className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm transition-all duration-150 ${sortOption === option.value
+                              ? 'bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400 font-semibold'
+                              : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 font-medium'
+                              }`}
+                          >
+                            <span className="flex-1 text-left">{option.label}</span>
+                            {sortOption === option.value && <Check className="w-4 h-4 text-primary-500" />}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+
+        {managedVault ? (
+          <div className="space-y-8 animate-in fade-in duration-300">
+            {/* Header / Navigation */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white dark:bg-gray-900 p-6 rounded-3xl border border-gray-100 dark:border-gray-800 shadow-sm">
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={() => setManagedVaultId(null)}
+                  className="p-3 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 rounded-2xl transition-all flex items-center justify-center border border-gray-200 dark:border-gray-700 active:scale-95 shadow-sm"
+                  title="Back to Dashboard"
+                >
+                  <ArrowLeft className="w-5 h-5 text-gray-600 dark:text-gray-200" />
+                </button>
+                <div>
+                  <h3 className="text-xl font-black text-gray-900 dark:text-white uppercase tracking-tight truncate max-w-[280px] sm:max-w-md">
+                    {managedVault.name}
+                  </h3>
+                  <div className="flex flex-wrap items-center gap-2 mt-1">
+                    <span className="text-[10px] text-gray-400 dark:text-gray-500 font-bold uppercase tracking-widest">Vault Control Center</span>
+                    <span className="text-gray-300 dark:text-gray-700">•</span>
+                    <span className="text-[10px] text-primary-600 dark:text-primary-400 font-black uppercase tracking-widest">{managedVault.vaultType} Mode</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Console Tabs */}
+              <div className="flex bg-gray-50 dark:bg-black/40 p-1.5 rounded-2xl border border-gray-150 dark:border-white/5 self-start sm:self-auto shadow-inner">
+                {[
+                  { id: 'edit', label: 'Edit settings', icon: Edit2 },
+                  { id: 'access', label: 'Security & Access', icon: Shield, badge: (managedVault.requests || []).filter(r => r.status === 'PENDING').length },
+                  { id: 'activity', label: 'Activity Intelligence', icon: AlertTriangle, badge: managedVault.reportCount || 0 }
+                ].map(tab => {
+                  const Icon = tab.icon;
+                  const isActive = managementTab === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      onClick={() => setManagementTab(tab.id as any)}
+                      className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all duration-300 relative ${
+                        isActive 
+                          ? 'bg-white dark:bg-gray-800 text-primary-600 dark:text-white shadow-sm border border-gray-100 dark:border-white/5' 
+                          : 'text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-305'
+                      }`}
+                    >
+                      <Icon className="w-3.5 h-3.5" />
+                      <span>{tab.label}</span>
+                      {!!tab.badge && (
+                        <span className={`px-1.5 py-0.5 rounded-full text-[9px] font-black leading-none ${tab.id === 'activity' ? 'bg-red-550 text-white animate-pulse' : 'bg-primary-500 text-white'}`}>
+                          {tab.badge}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Tab content panel */}
+            <div className="bg-white dark:bg-gray-900 rounded-3xl p-6 sm:p-10 border border-gray-100 dark:border-gray-800 shadow-xl space-y-12 mb-8 min-h-[400px]">
+              
+              {managementTab === 'edit' && (
+                <div className="animate-in fade-in duration-300">
+                  {/* Sticky subheader tab select for edit modal steps */}
+                  <div className="flex border-b border-gray-100 dark:border-gray-800 pb-4 mb-8 overflow-x-auto no-scrollbar gap-6">
+                    {[
+                      { id: 'identity', label: 'Identity', icon: Globe },
+                      { id: 'content', label: 'Content', icon: Grid },
+                      { id: 'lifecycle', label: 'Lifecycle', icon: Clock },
+                      { id: 'security', label: 'Security', icon: Shield },
+                      { id: 'design', label: 'Design', icon: Settings2 }
+                    ].map(step => {
+                      const Icon = step.icon;
+                      const isActive = activeModalTab === step.id;
+                      return (
+                        <button
+                          key={step.id}
+                          onClick={() => setActiveModalTab(step.id as any)}
+                          className={`flex items-center gap-2 pb-2 border-b-2 text-xs font-black uppercase tracking-wider whitespace-nowrap transition-all ${
+                            isActive 
+                              ? 'border-primary-500 text-primary-600 dark:text-primary-400' 
+                              : 'border-transparent text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300'
+                          }`}
+                        >
+                          <Icon className="w-3.5 h-3.5" />
+                          <span>{step.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Render the core form content */}
+                  {renderFormContent()}
+
+                  {/* Form Submission Actions inside management console */}
+                  <div className="flex justify-end gap-3 pt-8 border-t border-gray-100 dark:border-gray-800 mt-10">
+                    <button
+                      type="button"
+                      onClick={() => setManagedVaultId(null)}
+                      className="px-6 py-3 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-750 dark:text-gray-300 rounded-xl text-xs font-black uppercase tracking-widest transition-all active:scale-95 border border-gray-205 dark:border-white/5"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isSubmitting}
+                      onClick={handleSubmit}
+                      className="bg-primary-600 hover:bg-primary-700 disabled:opacity-50 text-white px-8 py-3 rounded-xl text-xs font-black uppercase tracking-widest shadow-md transition-all active:scale-95 flex items-center gap-2"
+                    >
+                      {isSubmitting ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" /> Saving Changes
+                        </>
+                      ) : (
+                        'Save configuration'
+                      )}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {managementTab === 'access' && (
+                <div className="animate-in fade-in duration-300 max-w-2xl mx-auto space-y-6">
+                  <div>
+                    <h4 className="text-sm font-black text-gray-900 dark:text-white uppercase tracking-tight">Access Requests</h4>
+                    <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 font-medium">Approve or reject requests to access this restricted vault.</p>
+                  </div>
+                  
+                  {!managedVault.requests || managedVault.requests.length === 0 ? (
+                    <div className="text-center py-20 bg-gray-50/50 dark:bg-black/20 rounded-3xl border-2 border-dashed border-gray-150 dark:border-white/5">
+                      <Shield className="w-12 h-12 mx-auto mb-4 text-gray-300 dark:text-gray-700" />
+                      <p className="text-sm font-black text-gray-900 dark:text-white uppercase">Vault Guard Secure</p>
+                      <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 font-medium">No incoming access requests received.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {managedVault.requests.map((req) => (
+                        <div key={req.id} className="flex items-center justify-between p-4 rounded-2xl border border-gray-150 dark:border-white/5 bg-gray-50/50 dark:bg-black/20 hover:border-primary-100 dark:hover:border-primary-900/30 transition-all">
+                          <div className="overflow-hidden">
+                            <p className="font-bold text-gray-900 dark:text-white truncate" title={req.email}>{req.email}</p>
+                            <p className="text-[10px] text-gray-450 dark:text-gray-500 font-bold uppercase tracking-wider mt-0.5">{new Date(req.requestedAt).toLocaleDateString()} • {new Date(req.requestedAt).toLocaleTimeString()}</p>
+                            <span className={`text-[10px] font-black uppercase tracking-widest mt-1 inline-block ${
+                              req.status === RequestStatus.APPROVED ? 'text-green-600 dark:text-green-400' :
+                              req.status === RequestStatus.REJECTED ? 'text-red-600 dark:text-red-400' : 'text-primary-605'
+                            }`}>
+                              Status: {req.status}
+                            </span>
+                          </div>
+                          {req.status === RequestStatus.PENDING && (
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => handleAccessResolution(managedVault.id, req.id, RequestStatus.APPROVED)}
+                                className="p-3 bg-green-50 dark:bg-green-950/20 text-green-600 dark:text-green-400 rounded-xl hover:bg-green-100 dark:hover:bg-green-900/40 border border-green-150 dark:border-green-900/30 active:scale-95 transition-all" 
+                                title="Approve"
+                              >
+                                <UserCheck className="w-4 h-4" />
+                              </button>
+                              <button
+                                onClick={() => handleAccessResolution(managedVault.id, req.id, RequestStatus.REJECTED)}
+                                className="p-3 bg-red-50 dark:bg-red-950/20 text-red-600 dark:text-red-400 rounded-xl hover:bg-red-100 dark:hover:bg-red-900/40 border border-red-150 dark:border-red-900/30 active:scale-95 transition-all" 
+                                title="Reject"
+                              >
+                                <UserX className="w-4 h-4" />
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {managementTab === 'activity' && (
+                <div className="animate-in fade-in duration-300 max-w-3xl mx-auto space-y-6">
+                  <div>
+                    <h4 className="text-sm font-black text-gray-900 dark:text-white uppercase tracking-tight">Intelligence Logs</h4>
+                    <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 font-medium">Community warning reports log for policy and malware enforcement.</p>
+                  </div>
+
+                  {loadingReports ? (
+                    <div className="flex flex-col items-center justify-center py-20 gap-4">
+                      <Loader2 className="w-8 h-8 text-primary-600 animate-spin" />
+                      <span className="text-xs font-black text-gray-400 uppercase tracking-widest">Scanning History...</span>
+                    </div>
+                  ) : vaultReports.length === 0 ? (
+                    <div className="text-center py-20 bg-gray-50/50 dark:bg-black/20 rounded-3xl border-2 border-dashed border-gray-150 dark:border-white/5">
+                      <ShieldCheck className="w-12 h-12 text-emerald-400 mx-auto mb-4" />
+                      <p className="text-sm font-black text-gray-900 dark:text-white uppercase">Vault Clean</p>
+                      <p className="text-xs text-gray-455 dark:text-gray-500 font-medium mt-1">No community violation reports received for this vault.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {vaultReports.map((report) => (
+                        <div key={report.id} className="p-6 bg-white dark:bg-black/20 border border-gray-150 dark:border-white/5 rounded-3xl hover:border-red-200 dark:hover:border-red-900/30 transition-all hover:shadow-lg shadow-sm">
+                          <div className="flex justify-between items-start mb-4">
+                            <div className="flex flex-wrap gap-2">
+                              {report.reason_virus && (
+                                <span className="bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-400 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase ring-1 ring-red-150 dark:ring-red-905/50">
+                                  Virus/Malware
+                                </span>
+                              )}
+                              {report.reason_content && (
+                                <span className="bg-primary-50 dark:bg-primary-950/30 text-primary-600 dark:text-primary-400 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase ring-1 ring-primary-150 dark:ring-primary-905/50">
+                                  Illegal Content
+                                </span>
+                              )}
+                              {!report.reason_virus && !report.reason_content && (
+                                <span className="bg-gray-50 dark:bg-white/5 text-gray-500 dark:text-gray-400 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase ring-1 ring-gray-150 dark:ring-white/10">
+                                  Other Violation
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-[10px] font-black text-gray-300 dark:text-gray-650 uppercase tracking-widest mt-1">
+                              {new Date(report.created_at).toLocaleString()}
+                            </span>
+                          </div>
+                          {report.fileIds && report.fileIds.length > 0 && (
+                            <div className="mt-4 space-y-2">
+                              <div className="flex items-center gap-2 px-3 py-1.5 bg-red-50 dark:bg-red-950/20 rounded-xl border border-red-100/50 dark:border-red-900/20 w-fit">
+                                <AlertTriangle className="w-3.5 h-3.5 text-red-500" />
+                                <span className="text-[10px] font-black text-red-600 dark:text-red-400 uppercase tracking-widest">Reported Objects:</span>
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                {report.fileIds.map((fid: string) => {
+                                  const file = managedVault?.files?.find((f: any) => f.id === fid);
+                                  return (
+                                    <div key={fid} className="flex items-center gap-2 px-3 py-2 bg-gray-50 dark:bg-white/5 rounded-xl border border-gray-100 dark:border-white/5">
+                                      <FileText className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500" />
+                                      <span className="text-xs font-bold text-gray-700 dark:text-gray-300 truncate">
+                                        {file?.name || "Unknown File"}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                          {report.custom_message && (
+                            <div className="bg-gray-50 dark:bg-white/5 p-4 rounded-2xl italic text-gray-650 dark:text-gray-400 text-xs font-medium border-l-4 border-l-red-200 dark:border-l-red-900/50 mt-4">
+                              "{report.custom_message}"
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Warn Box */}
+                  <div className="bg-amber-50 dark:bg-amber-955/20 border border-amber-100 dark:border-amber-900/30 rounded-2xl p-5 flex items-start gap-4">
+                    <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-500 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-xs font-black text-amber-800 dark:text-amber-400 uppercase tracking-widest mb-1">Owner Violation Advisory</p>
+                      <p className="text-xs text-amber-705 dark:text-amber-300 leading-relaxed font-medium">
+                        Accumulating 4 violation reports results in a 10-day safety lock. 10 reports will trigger automatic permanent self-destruction for community compliance.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center gap-6 border-b border-gray-200 dark:border-gray-800 mb-8 overflow-x-auto no-scrollbar">
+              <button
+                onClick={() => setActiveTab('vaults')}
+                className={`pb-4 text-sm font-bold transition-all relative flex items-center gap-2 whitespace-nowrap ${activeTab === 'vaults' ? 'text-primary-600' : 'text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300'}`}
+              >
+                <QrCode className="w-4 h-4" /> Active Vaults
+                {activeTab === 'vaults' && <div className="absolute bottom-0 left-0 right-0 h-1 bg-primary-600 rounded-t-full" />}
+              </button>
+              <button
+                onClick={() => setActiveTab('analytics')}
+                className={`pb-4 text-sm font-bold transition-all relative flex items-center gap-2 whitespace-nowrap ${activeTab === 'analytics' ? 'text-primary-600' : 'text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300'}`}
+              >
+                <TrendingUp className="w-4 h-4" /> Analytics
+                {activeTab === 'analytics' && <div className="absolute bottom-0 left-0 right-0 h-1 bg-primary-600 rounded-t-full" />}
+              </button>
+              <button
+                onClick={() => setActiveTab('deleted')}
+                className={`pb-4 text-sm font-bold transition-all relative flex items-center gap-2 whitespace-nowrap ${activeTab === 'deleted' ? 'text-primary-600' : 'text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300'}`}
+              >
+                <Trash2 className="w-4 h-4" /> Recently Deleted
+                {deletedLogs.length > 0 && <span className="bg-primary-100 dark:bg-primary-900/40 text-primary-600 dark:text-primary-400 text-xs px-1.5 py-0.5 rounded-full">{deletedLogs.length}</span>}
+                {activeTab === 'deleted' && <div className="absolute bottom-0 left-0 right-0 h-1 bg-primary-600 rounded-t-full" />}
+              </button>
+            </div>
+
+            {/* Vaults List */}
+            {activeTab === 'vaults' ? (
+              <div className="space-y-4">
+                <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-4">Your Vaults ({filteredVaults.length})</h2>
+
+                {filteredVaults.length === 0 ? (
+                  <div className="text-center py-20 bg-white dark:bg-gray-900 rounded-2xl border-2 border-dashed border-gray-200 dark:border-gray-800">
+                    <UploadCloud className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-4" />
+                    <h3 className="text-lg font-medium text-gray-900 dark:text-white">No vaults found</h3>
+                    <p className="text-gray-500 dark:text-gray-400 mb-6">Try adjusting your filters or search terms.</p>
+                    {vaults.length === 0 && (
+                      <button
+                        onClick={openCreateModal}
+                        className={`font-medium hover:underline ${isOverLimit ? 'text-gray-400 cursor-not-allowed' : 'text-primary-600'}`}
+                        disabled={isOverLimit}
+                      >
+                        Create Vault
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {filteredVaults.map(vault => (
+                      <VaultCard
+                        key={vault.id}
+                        vault={vault}
+                        menuOpenId={menuOpenId}
+                        toggleMenu={toggleMenu}
+                        isOverLimit={isOverLimit}
+                        openEditModal={openEditModal}
+                        openManageAccess={openManageAccess}
+                        handleDeleteVault={handleDeleteVault}
+                        setViewQrVault={setViewQrVault}
+                        setReportVault={setReportVault}
+                        setSubmittingVault={setSubmittingVault}
+                        setSelectedAnalyticsVault={setSelectedAnalyticsVault}
+                        formatBytes={formatBytes}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : activeTab === 'analytics' ? (
+              <AnalyticsPanel
+                vaults={vaults}
+                openCreateModal={openCreateModal}
+                setSelectedAnalyticsVault={setSelectedAnalyticsVault}
+                formatBytes={formatBytes}
+              />
+            ) : (
+              /* Recently Deleted Logs Tab */
+              <div className="animate-in fade-in duration-300">
+                <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm overflow-hidden">
+                  <div className="p-6 border-b border-gray-50 dark:border-gray-800 bg-gray-50/50 dark:bg-black/20 flex items-center justify-between">
+                    <div>
+                      <h3 className="font-bold text-gray-900 dark:text-white">Deletion History</h3>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Vaults auto-removed after {appUser?.plan === PlanType.STARTER ? '72 hours (Plus limit)' : '24 hours (Free limit)'}.
+                      </p>
+                    </div>
+                    {appUser?.plan !== PlanType.PRO && (
+                      <Link to="/pricing" className="text-xs font-bold text-primary-600 hover:underline flex items-center gap-1 uppercase tracking-wider">
+                        Stop Auto-Deletion <ExternalLink className="w-3 h-3" />
+                      </Link>
+                    )}
+                  </div>
+
+                  <div className="divide-y divide-gray-50 dark:divide-gray-800">
+                    {deletedLogs.length === 0 ? (
+                      <div className="p-12 text-center">
+                        <div className="bg-gray-50 dark:bg-gray-800 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4">
+                          <Trash2 className="text-gray-300 dark:text-gray-600 w-6 h-6" />
+                        </div>
+                        <p className="text-gray-500 dark:text-gray-400 text-sm">No vaults have been auto-deleted yet.</p>
+                      </div>
+                    ) : (
+                      deletedLogs.map((log) => (
+                        <div key={log.id} className="p-4 sm:p-6 flex items-center justify-between hover:bg-gray-50/50 dark:hover:bg-white/5 transition-colors">
+                          <div className="flex items-center gap-4">
+                            <div className="w-10 h-10 bg-red-50 dark:bg-red-900/30 rounded-xl flex items-center justify-center text-red-500 dark:text-red-400 font-bold">
+                              #
+                            </div>
+                            <div>
+                              <h4 className="font-bold text-gray-900 dark:text-white text-sm tracking-tight">{log.vault_name}</h4>
+                              <div className="flex items-center gap-2 mt-1">
+                                <div className="flex items-center gap-1 text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-tighter italic">
+                                  <Clock className="w-3 h-3" /> {new Date(log.created_at).toLocaleDateString()}
+                                </div>
+                                <span className="text-gray-200 dark:text-gray-800">|</span>
+                                <div className="flex items-center gap-1 text-xs font-black text-primary-600 dark:text-primary-400 bg-primary-50 dark:bg-primary-900/30 px-2 py-0.5 rounded-full border border-primary-100 dark:border-primary-800">
+                                  <Eye className="w-3 h-3" /> {log.views || 0} TOTAL SCANS
+                                </div>
+                                {log.deletion_reason && (
+                                  <span className="text-xs bg-amber-50 dark:bg-amber-900/10 text-amber-700 dark:text-amber-400 px-2 py-0.5 rounded font-black border border-amber-100 dark:border-amber-900/30 uppercase tracking-tighter whitespace-nowrap">
+                                    {log.deletion_reason}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex flex-col items-end gap-2 text-right">
+                            <div>
+                              <p className="text-xs font-bold text-red-500 uppercase tracking-wider">Auto-Deleted</p>
+                              <p className="text-xs text-gray-400">{new Date(log.deleted_at).toLocaleDateString()}</p>
+                            </div>
+                            {(appUser?.plan === PlanType.STARTER || appUser?.plan === PlanType.PRO) && (
+                              <button
+                                onClick={() => handleRecoverVault(log)}
+                                disabled={isSubmitting}
+                                className="bg-primary-600 hover:bg-primary-700 text-white px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-widest shadow-lg shadow-primary-500/20 dark:shadow-none dark:shadow-none transition-all active:scale-95 disabled:opacity-50 flex items-center gap-2"
+                              >
+                                <RotateCcw className="w-3 h-3" /> Recover
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {deletedLogs.length > 0 && (
+                    <div className="p-4 bg-amber-50 dark:bg-amber-900/10 border-t border-amber-100 dark:border-amber-900/20 flex items-center gap-3">
+                      <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-500 flex-shrink-0" />
+                      <p className="text-xs text-amber-700 dark:text-amber-400 leading-relaxed font-medium">
+                        {appUser?.plan === PlanType.STARTER
+                          ? "Your Plus vaults are automatically removed after 72 hours or once their scan limit is reached."
+                          : "Free vaults are automatically deleted after 24 hours to save server space."}
+                        {appUser?.plan !== PlanType.PRO && (
+                          <Link to="/pricing" className="ml-1 underline font-bold text-amber-800 dark:text-amber-300">Upgrade to Pro</Link>
+                        )} for permanent storage.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {isModalOpen && modalMode === 'EDIT' && (
+        <div className="fixed inset-0 bg-black/60 dark:bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
+          <div className="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-4xl max-h-[95vh] overflow-y-auto shadow-2xl animate-in fade-in zoom-in-95 duration-200 border border-gray-100 dark:border-gray-800 custom-scrollbar p-1"
+            style={{
+              scrollbarWidth: 'thin',
+              scrollbarColor: 'rgba(139,92,246,0.35) transparent'
+            }}
+          >
+            {/* Consolidated Sticky Header Group */}
+            <div className="sticky top-0 bg-white dark:bg-gray-900 z-30 border-b border-gray-100 dark:border-gray-800 shadow-sm">
+              <div className="p-6 flex justify-between items-center">
+                <h2 className="text-xl font-bold text-gray-900 dark:text-white">
+                  Edit Vault
+                </h2>
+                <button
+                  onClick={() => setIsModalOpen(false)}
+                  className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl transition-colors"
+                >
+                  <X className="text-gray-500 dark:text-gray-400 w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Tab Navigation */}
+              <div className="relative group/tabs">
+                <div className="flex px-8 sm:px-10 gap-6 sm:gap-8 overflow-x-auto no-scrollbar scroll-smooth">
+                  {[
+                    { id: 'identity', label: 'Identity', icon: Globe },
+                    { id: 'content', label: 'Content', icon: Grid },
+                    { id: 'lifecycle', label: 'Lifecycle', icon: Clock },
+                    { id: 'security', label: 'Security', icon: Shield },
+                    { id: 'design', label: 'Design', icon: Settings2 }
+                  ].map((tab) => (
+                    <button
+                      key={tab.id}
+                      onClick={() => setActiveModalTab(tab.id as any)}
+                      className={`pb-4 text-xs font-black uppercase tracking-[0.2em] relative flex items-center gap-2.5 transition-all whitespace-nowrap ${
+                        activeModalTab === tab.id
+                          ? 'text-primary-600 dark:text-primary-400'
+                          : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'
+                      }`}
+                    >
+                      <tab.icon className="w-3.5 h-3.5" />
+                      {tab.label}
+                      {activeModalTab === tab.id && (
+                        <div className="absolute bottom-0 left-0 right-0 h-1 bg-primary-500 rounded-t-full shadow-[0_-4px_12px_rgba(124,58,237,0.4)]" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Content Body */}
+            <div className="p-6 sm:p-10 space-y-12">
+              <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+                {renderFormContent()}
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="border-t border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-[#0d0f14] p-4 sm:p-6 rounded-b-2xl">
+              {isSubmitting && (
+                <div className="mb-8 p-6 bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-3xl animate-in slide-in-from-bottom-4 duration-500 shadow-sm">
+                  {/* Transmission Pipeline */}
+                  <div className="flex items-center justify-between mb-6">
+                    <div className="flex items-center gap-3">
+                      <div className="w-8 h-8 bg-primary-500/10 rounded-xl flex items-center justify-center">
+                        <Loader2 className="w-4 h-4 text-primary-500 animate-spin" />
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-black text-gray-900 dark:text-white uppercase tracking-widest leading-none mb-1">Transmission Pipeline</h4>
+                        <p className="text-xs text-gray-400 font-bold uppercase tracking-widest">Active Data Stream</p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-xl font-black text-primary-600 dark:text-primary-400 leading-none">{uploadProgress}%</span>
+                      {estimatedSeconds > 0 && (
+                        <p className="text-xs text-gray-400 font-black uppercase tracking-[0.2em] mt-1">ETA: {estimatedSeconds}s</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Todo List / Steps */}
+
+
+                  {/* Progress Bar Container */}
+                  <div className="w-full bg-gray-100 dark:bg-gray-800 h-1.5 rounded-full overflow-hidden">
+                    <div 
+                      className="h-full bg-primary-500 shadow-[0_0_15px_rgba(var(--primary-rgb),0.5)] transition-all duration-700 ease-out relative"
+                      style={{ width: `${uploadProgress}%` }}
+                    >
+                      <div className="absolute inset-0 bg-white/20 animate-pulse" />
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center justify-between gap-4">
+                <button
+                  onClick={() => setIsModalOpen(false)}
+                  disabled={isSubmitting}
+                  className="px-6 py-3 text-sm font-black text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-white transition-colors uppercase tracking-widest"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSubmit}
+                  disabled={isSubmitting}
+                  className="bg-primary-600 hover:bg-primary-700 text-white px-8 py-3 rounded-xl font-black text-xs shadow-xl shadow-primary-500/20 active:scale-95 transition-all flex items-center gap-2 uppercase tracking-widest"
+                >
+                  {isSubmitting ? <Loader2 className="animate-spin w-4 h-4" /> : 'Save Changes'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+          {/* Free Plan Limit Modal */}
+          {isFreeLimitModalOpen && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl w-full max-w-sm shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+                <div className="p-6 border-b border-gray-100 dark:border-gray-800 flex justify-between items-center bg-white dark:bg-gray-900 rounded-t-2xl">
+                  <h2 className="text-xl font-bold text-gray-900 dark:text-white">Vault Limit Reached</h2>
+                  <button onClick={() => setIsFreeLimitModalOpen(false)} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl transition-colors"><X className="text-gray-500 dark:text-gray-400 w-5 h-5" /></button>
+                </div>
+                <div className="p-6 text-center">
+                  <div className="bg-amber-100 text-amber-600 rounded-full w-16 h-16 flex items-center justify-center mx-auto mb-4">
+                    <Lock className="w-8 h-8" />
+                  </div>
+                  <p className="text-gray-700 font-medium mb-2">Free subscription only can make 2 vaults</p>
+                  <p className="text-sm text-gray-500 mb-6 font-medium max-w-[240px] mx-auto">for more go for Plus/Pro plans</p>
+                  <div className="flex flex-col gap-3">
+                    <Link to="/pricing" className="w-full bg-primary-600 hover:bg-primary-700 text-white font-bold py-2.5 rounded-xl transition-all shadow-md active:scale-95" onClick={() => setIsFreeLimitModalOpen(false)}>
+                      Go to Plans
+                    </Link>
+                    <button onClick={() => setIsFreeLimitModalOpen(false)} className="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-2.5 rounded-xl transition-all">
+                      Maybe Later
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* File Destruct Settings Modal */}
+          {selectedFileForSettings && (() => {
+            const isNew = selectedFileForSettings.type === 'NEW';
+            const file = isNew ? selectedFiles[selectedFileForSettings.index] : existingFiles[selectedFileForSettings.index];
+            if (!file) { setSelectedFileForSettings(null); return null; }
+            
+            const fileId = isNew ? selectedFileForSettings.index : (file as any).id;
+            const currentSettings = fileSettings[fileId] || {};
+
+            return (
+              <div className="fixed inset-0 bg-black/60 backdrop-blur-md z-[100] flex items-center justify-center p-4 animate-in fade-in duration-300">
+                <div className="bg-white dark:bg-[#0d0f14] rounded-[2.5rem] w-full max-w-lg shadow-2xl border border-gray-100 dark:border-white/5 overflow-hidden animate-in zoom-in-95 duration-300">
+                  <div className="p-8 border-b border-gray-50 dark:border-white/5 flex justify-between items-center bg-gray-50/50 dark:bg-black/20">
+                    <div className="flex items-center gap-4">
+                      <div className="w-12 h-12 bg-primary-500/10 rounded-2xl flex items-center justify-center text-primary-600 dark:text-primary-400">
+                        <ShieldCheck className="w-6 h-6" />
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-black text-gray-900 dark:text-white uppercase tracking-[0.2em] leading-none mb-1">File Security</h3>
+                        <p className="text-xs text-gray-400 font-bold uppercase tracking-widest truncate max-w-[200px]">{file.name}</p>
+                      </div>
+                    </div>
+                    <button onClick={() => setSelectedFileForSettings(null)} className="p-3 hover:bg-white dark:hover:bg-white/5 rounded-2xl transition-all border border-transparent hover:border-gray-200 dark:hover:border-white/10 shadow-sm"><X className="text-gray-400 w-5 h-5" /></button>
+                  </div>
+                  
+                  <div className="p-10 space-y-8">
+                    {/* Max Downloads */}
+                    <div className="space-y-4">
+                      <label className="flex items-center gap-2 text-xs font-black text-gray-400 uppercase tracking-widest ml-1">
+                        <Download className="w-3.5 h-3.5" /> Access Capacity
+                      </label>
+                      <input 
+                        type="number"
+                        placeholder="UNLIMITED..."
+                        className="w-full px-6 py-5 bg-white dark:bg-black border border-gray-200 dark:border-gray-800 rounded-2xl font-black text-xs dark:text-white uppercase tracking-widest outline-none focus:ring-4 focus:ring-primary-500/10 shadow-inner"
+                        value={currentSettings.maxDownloads || ''}
+                        onChange={(e) => setFileSettings(prev => ({
+                          ...prev,
+                          [fileId]: { ...currentSettings, maxDownloads: parseInt(e.target.value) || undefined }
+                        }))}
+                      />
+                    </div>
+
+                    {/* Auto-Nuke Timer */}
+                    <div className="space-y-4">
+                      <label className="flex items-center gap-2 text-xs font-black text-gray-400 uppercase tracking-widest ml-1">
+                        <Zap className="w-3.5 h-3.5 text-yellow-500" /> Auto-Nuke Timer
+                      </label>
+                      <div className="relative">
+                        <input 
+                          type="number"
+                          placeholder="EXPIRES IN (MINUTES)..."
+                          className="w-full px-6 py-5 bg-white dark:bg-black border border-gray-200 dark:border-gray-800 rounded-2xl font-black text-xs dark:text-white uppercase tracking-widest outline-none focus:ring-4 focus:ring-primary-500/10 shadow-inner"
+                          value={currentSettings.deleteAfterMinutes || ''}
+                          onChange={(e) => setFileSettings(prev => ({
+                            ...prev,
+                            [fileId]: { ...currentSettings, deleteAfterMinutes: parseInt(e.target.value) || undefined }
+                          }))}
+                        />
+                        <div className="absolute right-6 top-1/2 -translate-y-1/2 text-xs font-black text-gray-400 uppercase tracking-widest">MINS</div>
+                      </div>
+                    </div>
+
+                    <button 
+                      onClick={() => setSelectedFileForSettings(null)}
+                      className="w-full py-5 bg-gray-900 dark:bg-white text-white dark:text-gray-900 rounded-2xl font-black text-xs uppercase tracking-[0.2em] shadow-xl hover:shadow-primary-500/10 active:scale-95 transition-all mt-4"
+                    >
+                      Authenticate Protocol
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Access Management Modal */}
+          {isAccessModalOpen && managingVault && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+                <div className="p-6 border-b border-gray-100 dark:border-gray-800 flex justify-between items-center bg-white dark:bg-gray-900 rounded-t-2xl">
+                  <h2 className="text-xl font-bold text-gray-900 dark:text-white">Access Requests</h2>
+                  <button onClick={() => setIsAccessModalOpen(false)} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl transition-colors"><X className="text-gray-500 dark:text-gray-400 w-5 h-5" /></button>
+                </div>
+                <div className="p-6">
+                  {!managingVault.requests || managingVault.requests.length === 0 ? (
+                    <div className="text-center py-8 text-gray-500">
+                      <Shield className="w-12 h-12 mx-auto mb-3 text-gray-300" />
+                      <p>No access requests yet.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-4 max-h-[60vh] overflow-y-auto">
+                      {managingVault?.requests?.map((req) => (
+                        <div key={req.id} className="flex items-center justify-between p-3 rounded-lg border border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/50">
+                          <div className="overflow-hidden">
+                            <p className="font-semibold text-gray-900 truncate" title={req.email}>{req.email}</p>
+                            <p className="text-xs text-gray-500">{new Date(req.requestedAt).toLocaleDateString()}</p>
+                            <span className={`text-xs font-bold uppercase ${req.status === RequestStatus.APPROVED ? 'text-green-600' :
+                              req.status === RequestStatus.REJECTED ? 'text-red-600' : 'text-primary-600'
+                              }`}>
+                              {req.status}
+                            </span>
+                          </div>
+                          {req.status === RequestStatus.PENDING && (
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => handleAccessResolution(managingVault.id, req.id, RequestStatus.APPROVED)}
+                                className="p-2 bg-green-100 text-green-700 rounded hover:bg-green-200" title="Approve">
+                                <UserCheck className="w-4 h-4" />
+                              </button>
+                              <button
+                                onClick={() => handleAccessResolution(managingVault.id, req.id, RequestStatus.REJECTED)}
+                                className="p-2 bg-red-100 text-red-700 rounded hover:bg-red-200" title="Reject">
+                                <UserX className="w-4 h-4" />
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* QR Modal */}
+          {viewQrVault && (
+            <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+              <div className="bg-white dark:bg-gray-900 rounded-2xl p-8 max-w-sm w-full text-center relative shadow-2xl">
+                <button onClick={() => setViewQrVault(null)} className="absolute top-4 right-4 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"><X className="w-5 h-5" /></button>
+                <h3 className="text-xl font-bold text-gray-900 dark:text-white mb-6">{viewQrVault.name}</h3>
+
+                <div className="bg-white p-4 rounded-xl border border-gray-200 inline-block shadow-inner mb-6 relative group">
+                  <QRCode id="qr-code-svg" value={getQrUrl(viewQrVault)} size={200} />
+                </div>
+
+                <div className="space-y-3">
+                  <button
+                    onClick={downloadQrCode}
+                    className="w-full py-2.5 bg-gray-900 text-white rounded-lg font-medium text-sm hover:bg-gray-800 transition-colors shadow-sm flex items-center justify-center gap-2"
+                  >
+                    <Download className="w-4 h-4" /> Download QR
+                  </button>
+
+                  <div className="flex gap-2">
+                    <a
+                      href={getQrUrl(viewQrVault)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="flex-1 py-2 bg-primary-600 text-white rounded-lg font-medium text-sm hover:bg-primary-700 transition-colors shadow-sm"
+                    >
+                      Open Link
+                    </a>
+                    <button
+                      onClick={() => copyToClipboard(getQrUrl(viewQrVault))}
+                      className="px-3 py-2 bg-gray-100 text-gray-600 rounded-lg hover:bg-gray-200 transition-colors"
+                      title="Copy Link"
+                    >
+                      {copied ? <Check className="w-5 h-5 text-green-600" /> : <Copy className="w-5 h-5" />}
+                    </button>
+                  </div>
+                  <div className="text-xs text-gray-400 break-all">
+                    {getQrUrl(viewQrVault)}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Custom Delete Confirmation Modal */}
+          {deleteConfirmId && (() => {
+            const vaultToDelete = vaults.find(v => v.id === deleteConfirmId);
+            return (
+              <div className="fixed inset-0 bg-black/70 dark:bg-black/90 backdrop-blur-md z-[60] flex items-center justify-center p-4 animate-in fade-in duration-200">
+                <div className="bg-white dark:bg-gray-950 rounded-[2rem] w-full max-w-sm shadow-2xl animate-in zoom-in-95 duration-200 border border-red-100 dark:border-red-900/30 overflow-hidden">
+                  {/* Red top accent */}
+                  <div className="h-1 w-full bg-gradient-to-r from-red-500 to-rose-600" />
+                  <div className="p-8 flex flex-col items-center text-center">
+                    <div className="w-16 h-16 bg-red-50 dark:bg-red-900/20 rounded-2xl flex items-center justify-center mb-5 border border-red-100 dark:border-red-900/30">
+                      <Trash2 className="w-8 h-8 text-red-500 dark:text-red-400" />
+                    </div>
+                    <h2 className="text-xl font-black text-gray-900 dark:text-white mb-2 tracking-tight">Delete Vault?</h2>
+                    <p className="text-gray-500 dark:text-gray-400 text-sm mb-1">
+                      Are you sure you want to delete
+                    </p>
+                    <p className="font-bold text-gray-900 dark:text-white mb-5 truncate max-w-full text-sm">&#8220;{vaultToDelete?.name}&#8221;</p>
+                    <p className="text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-xl px-4 py-3 mb-7 border border-red-100 dark:border-red-900/30 leading-relaxed font-medium">
+                      This will permanently delete the QR code and all files. This action cannot be undone.
+                    </p>
+                    <div className="flex gap-3 w-full">
+                      <button
+                        onClick={() => setDeleteConfirmId(null)}
+                        disabled={isDeleting}
+                        className="flex-1 py-3 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300 font-black text-xs uppercase tracking-widest rounded-xl transition-all disabled:opacity-50 border border-gray-200 dark:border-gray-700"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={confirmDeleteVault}
+                        disabled={isDeleting}
+                        className="flex-1 py-3 bg-red-600 hover:bg-red-700 dark:bg-red-700 dark:hover:bg-red-600 text-white font-black text-xs uppercase tracking-widest rounded-xl transition-all flex items-center justify-center gap-2 disabled:opacity-70 shadow-lg shadow-red-500/20 dark:shadow-none"
+                      >
+                        {isDeleting ? <Loader2 className="animate-spin w-4 h-4" /> : <Trash2 className="w-4 h-4" />}
+                        {isDeleting ? 'Deleting...' : 'Yes, Delete'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+          {/* Reports History Modal */}
+          {reportVault && (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in" onClick={() => setReportVault(null)}>
+              <div className="bg-white rounded-[2rem] w-full max-w-2xl p-8 shadow-2xl animate-in zoom-in-95 overflow-hidden flex flex-col max-h-[70vh]" onClick={(e) => e.stopPropagation()}>
+                <div className="flex justify-between items-center mb-8">
+                  <div className="flex items-center gap-4">
+                    <div className="bg-red-50 p-3 rounded-2xl text-red-500">
+                      <Shield className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <h3 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight leading-none mb-1">Reports History</h3>
+                      <p className="text-xs font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">{reportVault.name}</p>
+                    </div>
+                  </div>
+                  <button onClick={() => setReportVault(null)} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl transition-colors text-gray-400"><X className="w-6 h-6" /></button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto pr-2 space-y-4 no-scrollbar">
+                  {loadingReports ? (
+                    <div className="flex flex-col items-center justify-center py-20 gap-4">
+                      <Loader2 className="w-8 h-8 text-primary-600 animate-spin" />
+                      <span className="text-xs font-black text-gray-400 uppercase tracking-widest">Scanning History...</span>
+                    </div>
+                  ) : vaultReports.length === 0 ? (
+                    <div className="text-center py-20 bg-gray-50/50 dark:bg-black/20 rounded-3xl border-2 border-dashed border-gray-100 dark:border-white/5">
+                      <ShieldCheck className="w-12 h-12 text-emerald-400 mx-auto mb-4" />
+                      <p className="text-sm font-black text-gray-900 uppercase">Vault Clean</p>
+                      <p className="text-xs text-gray-400 font-medium mt-1">No community reports received for this vault.</p>
+                    </div>
+                  ) : (
+                    vaultReports.map((report) => (
+                      <div key={report.id} className="p-5 bg-white border-2 border-gray-50 rounded-3xl hover:border-red-50 transition-all hover:shadow-lg hover:shadow-red-50/20 group">
+                        <div className="flex justify-between items-start mb-3">
+                          <div className="flex flex-wrap gap-2">
+                            {report.reason_virus && <span className="bg-red-50 text-red-600 px-2 py-1 rounded-lg text-xs font-black uppercase ring-1 ring-red-100">Virus/Malware</span>}
+                            {report.reason_content && <span className="bg-primary-50 text-primary-600 px-2 py-1 rounded-lg text-xs font-black uppercase ring-1 ring-orange-100">Illegal Content</span>}
+                            {!report.reason_virus && !report.reason_content && <span className="bg-gray-50 text-gray-500 px-2 py-1 rounded-lg text-xs font-black uppercase ring-1 ring-gray-100">Other Violation</span>}
+                          </div>
+                          <span className="text-xs font-black text-gray-300 uppercase tracking-tighter">{new Date(report.created_at).toLocaleString()}</span>
+                        </div>
+                        {report.fileIds && report.fileIds.length > 0 && (
+                          <div className="mt-3 space-y-2">
+                            <div className="flex items-center gap-2 px-3 py-1.5 bg-red-50/50 rounded-xl border border-red-100/50 w-fit">
+                              <AlertTriangle className="w-3 h-3 text-red-500" />
+                              <span className="text-xs font-black text-red-600 uppercase tracking-tight">Reported Content:</span>
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              {report.fileIds.map((fid: string) => {
+                                const file = reportVault?.files?.find((f: any) => f.id === fid);
+                                return (
+                                  <div key={fid} className="flex items-center gap-2 px-3 py-2 bg-gray-50 dark:bg-white/5 rounded-xl border border-gray-100 dark:border-white/5">
+                                    <FileText className="w-3 h-3 text-gray-400" />
+                                    <span className="text-xs font-medium text-gray-700 truncate">
+                                      {file?.name || "Unknown File"}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                        {report.custom_message && (
+                          <div className="bg-gray-50/50 dark:bg-white/5 p-4 rounded-2xl italic text-gray-600 dark:text-gray-400 text-xs font-medium border-l-4 border-l-red-100 dark:border-l-red-900/50 mt-3">
+                            "{report.custom_message}"
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                <div className="mt-8 bg-amber-50 border border-amber-100 rounded-2xl p-5 flex items-start gap-4">
+                  <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-xs font-black text-amber-800 uppercase tracking-tight mb-1">Owner Warning</p>
+                    <p className="text-xs text-amber-700/80 font-medium leading-relaxed">
+                      Accumulating 4 reports will result in a 10-day lock. 10 reports will trigger automatic permanent deletion for community safety.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {/* File-Specific Setting Modal (Delete Rules) - Redesigned Broad Layout */}
+          {selectedFileForSettings && (
+            <div className="fixed inset-0 bg-black/60 dark:bg-black/95 backdrop-blur-xl z-[100] flex items-center justify-center p-4 animate-in fade-in duration-500">
+              <div className="bg-white dark:bg-[#0d0f14] rounded-[3rem] w-full max-w-5xl shadow-[0_32px_64px_-16px_rgba(0,0,0,0.3)] dark:shadow-[0_32px_64px_-16px_rgba(0,0,0,0.8)] animate-in zoom-in-95 duration-500 border border-white/20 dark:border-white/5 overflow-hidden relative">
+                <div className="absolute top-0 left-0 w-full h-1.5 bg-gradient-to-r from-primary-600 via-primary-400 to-indigo-600 opacity-80"></div>
+
+                <div className="p-10 md:p-12">
+                  <div className="flex justify-between items-start mb-10">
+                    <div className="flex items-center gap-5">
+                      <div className="w-14 h-14 bg-primary-600 dark:bg-primary-500 rounded-[1.5rem] flex items-center justify-center shadow-2xl shadow-primary-500/20 rotate-3">
+                        <Trash2 className="w-7 h-7 text-white" />
+                      </div>
+                      <div>
+                        <h3 className="text-3xl font-black text-gray-900 dark:text-white tracking-tighter uppercase italic leading-none">Delete File</h3>
+                        <p className="text-xs font-black text-primary-600 dark:text-primary-400 uppercase tracking-[0.2em] mt-2">File Deletion Rules</p>
+                      </div>
+                    </div>
+                    <button onClick={() => setSelectedFileForSettings(null)} className="p-3 hover:bg-gray-100 dark:hover:bg-white/5 rounded-2xl transition-all active:scale-90 text-gray-400 hover:text-gray-900 dark:hover:text-white border border-transparent hover:border-gray-200 dark:hover:border-white/10"><X className="w-6 h-6" /></button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    {/* 1. Max Downloads */}
+                    <div className="bg-gray-50 dark:bg-black/60 p-6 rounded-[2rem] border border-gray-100 dark:border-white/5 relative group transition-all hover:bg-white dark:hover:bg-primary-900/10 hover:shadow-xl hover:shadow-primary-500/5">
+                      <div className="flex items-center justify-between mb-5">
+                        <div className="flex items-center gap-3">
+                          <div className="p-2 bg-primary-100 dark:bg-primary-900/30 rounded-xl">
+                            <Download className="w-4 h-4 text-primary-600 dark:text-primary-400" />
+                          </div>
+                          <span className="text-xs font-black text-gray-900 dark:text-gray-200 uppercase tracking-tight">Download Limit</span>
+                        </div>
+                        {appUser?.plan === PlanType.FREE && (
+                          <span className="text-xs font-black bg-primary-100 dark:bg-primary-500/20 text-primary-700 dark:text-primary-300 px-2 py-0.5 rounded-full uppercase tracking-widest">Plus+</span>
+                        )}
+                      </div>
+                      <div className="relative">
+                        <input
+                          type="number"
+                          disabled={appUser?.plan === PlanType.FREE}
+                          placeholder="Unlimited"
+                          value={fileSettings[selectedFileForSettings.type === 'NEW' ? selectedFileForSettings.index : selectedFileForSettings.index as any]?.maxDownloads || ''}
+                          onChange={(e) => {
+                            const val = e.target.value === '' ? undefined : parseInt(e.target.value);
+                            const key = selectedFileForSettings.type === 'NEW' ? selectedFileForSettings.index : selectedFileForSettings.index as any;
+                            setFileSettings({ ...fileSettings, [key]: { ...fileSettings[key], maxDownloads: val } });
+                          }}
+                          className={`w-full bg-white dark:bg-black/40 dark:text-white border border-gray-200 dark:border-white/10 rounded-2xl px-5 py-4 outline-none focus:ring-2 focus:ring-primary-500 transition-all font-bold text-sm ${appUser?.plan === PlanType.FREE ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        />
+                        <div className="absolute right-4 top-1/2 -translate-y-1/2 text-xs text-gray-400 dark:text-gray-500 font-bold uppercase tracking-widest pointer-events-none">Hits</div>
+                      </div>
+                      <p className="text-xs text-gray-400 dark:text-gray-500 mt-4 font-bold uppercase tracking-tight leading-relaxed">Auto-delete after reaching this many successful downloads.</p>
+                    </div>
+
+                    {/* 2. Vanishing Timer */}
+                    <div className="bg-gray-50 dark:bg-black/60 p-6 rounded-[2rem] border border-gray-100 dark:border-white/5 relative group transition-all hover:bg-white dark:hover:bg-primary-900/10 hover:shadow-xl hover:shadow-primary-500/5">
+                      <div className="flex items-center justify-between mb-5">
+                        <div className="flex items-center gap-3">
+                          <div className="p-2 bg-primary-100 dark:bg-primary-900/30 rounded-xl">
+                            <Clock className="w-4 h-4 text-primary-600 dark:text-primary-400" />
+                          </div>
+                          <span className="text-xs font-black text-gray-900 dark:text-gray-200 uppercase tracking-tight">Vanishing Timer</span>
+                        </div>
+                        {appUser?.plan === PlanType.FREE && (
+                          <span className="text-xs font-black bg-primary-100 dark:bg-primary-500/20 text-primary-700 dark:text-primary-300 px-2 py-0.5 rounded-full uppercase tracking-widest">Plus+</span>
+                        )}
+                      </div>
+                      <div className="relative">
+                        <select
+                          disabled={appUser?.plan === PlanType.FREE}
+                          value={fileSettings[selectedFileForSettings.type === 'NEW' ? selectedFileForSettings.index : selectedFileForSettings.index as any]?.deleteAfterMinutes || ''}
+                          onChange={(e) => {
+                            const val = e.target.value === '' ? undefined : parseInt(e.target.value);
+                            const key = selectedFileForSettings.type === 'NEW' ? selectedFileForSettings.index : selectedFileForSettings.index as any;
+                            setFileSettings({ ...fileSettings, [key]: { ...fileSettings[key], deleteAfterMinutes: val } });
+                          }}
+                          className={`w-full bg-white dark:bg-black/80 dark:text-white border border-gray-200 dark:border-white/10 rounded-2xl pl-5 pr-12 py-4 outline-none focus:ring-4 focus:ring-primary-500/20 transition-all font-bold text-sm appearance-none shadow-sm hover:border-gray-300 dark:hover:border-white/20 ${appUser?.plan === PlanType.FREE ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                        >
+                          <option className="dark:bg-gray-900 text-gray-900 dark:text-gray-100" value="">Never vanish</option>
+                          <option className="dark:bg-gray-900 text-gray-900 dark:text-gray-100" value="1">1 Minute after opening</option>
+                          <option className="dark:bg-gray-900 text-gray-900 dark:text-gray-100" value="5">5 Minutes after opening</option>
+                          <option className="dark:bg-gray-900 text-gray-900 dark:text-gray-100" value="60">1 Hour after opening</option>
+                          <option className="dark:bg-gray-900 text-gray-900 dark:text-gray-100" value="1440">24 Hours after opening</option>
+                        </select>
+                        <div className="absolute inset-y-0 right-0 flex items-center pr-5 pointer-events-none">
+                          <ChevronDown className="w-5 h-5 text-gray-400" />
+                        </div>
+                      </div>
+                      <p className="text-xs text-gray-400 dark:text-gray-500 mt-4 font-bold uppercase tracking-tight leading-relaxed">Countdown begins once the visitor first previews or downloads this file.</p>
+                    </div>
+
+                    {/* 3. Hard Expiry */}
+                    <div className="bg-gray-50 dark:bg-black/60 p-6 rounded-[2rem] border border-gray-100 dark:border-white/5 relative group transition-all hover:bg-white dark:hover:bg-primary-900/10 hover:shadow-xl hover:shadow-primary-500/5">
+                      <div className="flex items-center justify-between mb-5">
+                        <div className="flex items-center gap-3">
+                          <div className="p-2 bg-primary-100 dark:bg-primary-900/30 rounded-xl">
+                            <Calendar className="w-4 h-4 text-primary-600 dark:text-primary-400" />
+                          </div>
+                          <span className="text-xs font-black text-gray-900 dark:text-gray-200 uppercase tracking-tight">Hard Expiry</span>
+                        </div>
+                        {appUser?.plan === PlanType.FREE && (
+                          <span className="text-xs font-black bg-primary-100 dark:bg-primary-500/20 text-primary-700 dark:text-primary-300 px-2 py-0.5 rounded-full uppercase tracking-widest">Plus+</span>
+                        )}
+                      </div>
+                      <input
+                        type="datetime-local"
+                        disabled={appUser?.plan === PlanType.FREE}
+                        value={fileSettings[selectedFileForSettings.type === 'NEW' ? selectedFileForSettings.index : selectedFileForSettings.index as any]?.expiresAt || ''}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          const key = selectedFileForSettings.type === 'NEW' ? selectedFileForSettings.index : selectedFileForSettings.index as any;
+                          setFileSettings({ ...fileSettings, [key]: { ...fileSettings[key], expiresAt: val } });
+                        }}
+                        className={`w-full bg-white dark:bg-black/60 dark:text-white border border-gray-200 dark:border-white/10 rounded-2xl px-5 py-4 outline-none focus:ring-2 focus:ring-primary-500 transition-all font-bold text-sm ${appUser?.plan === PlanType.FREE ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      />
+                      <p className="text-xs text-gray-400 dark:text-gray-500 mt-4 font-bold uppercase tracking-tight leading-relaxed">File will vanish on this specific date regardless of views.</p>
+                    </div>
+                  </div>
+
+                  <div className="mt-12 flex gap-4 max-w-xs mx-auto md:mx-0">
+                    {appUser?.plan === PlanType.FREE ? (
+                      <Link to="/pricing" onClick={() => setSelectedFileForSettings(null)} className="w-full bg-gradient-to-r from-primary-600 to-indigo-600 hover:from-primary-700 hover:to-indigo-700 text-white py-4 px-8 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-primary-500/20 flex items-center justify-center gap-3 transition-all hover:scale-[1.02] active:scale-95">
+                        <Zap className="w-4 h-4 fill-current text-white" /> Upgrade to Plus
+                      </Link>
+                    ) : (
+                      <button onClick={() => setSelectedFileForSettings(null)} className="w-full bg-primary-600 hover:bg-primary-700 text-white py-4 px-8 rounded-2xl font-black text-xs uppercase tracking-widest shadow-xl shadow-primary-500/20 dark:shadow-none active:scale-95 transition-all">
+                        Apply Protocol
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        {/* Analytics Modal */}
+        {selectedAnalyticsVault && (
+          <div className="fixed inset-0 bg-black/60 dark:bg-black/90 backdrop-blur-md z-[60] flex items-center justify-center p-2 sm:p-4">
+            <div className="bg-slate-50 dark:bg-[#07080a] w-full max-w-5xl max-h-[95vh] overflow-y-auto rounded-[2rem] shadow-2xl border border-gray-100 dark:border-white/5 flex flex-col animate-in fade-in zoom-in-95 duration-300 custom-scrollbar p-1">
+              
+              {/* Modal Top Control Header */}
+              <div className="p-6 pb-4 border-b border-gray-100 dark:border-white/5 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="flex items-center gap-4">
+                  <button
+                    onClick={() => setSelectedAnalyticsVault(null)}
+                    className="p-2.5 bg-white dark:bg-gray-900 hover:bg-gray-100 dark:hover:bg-white/10 rounded-xl transition-all border border-gray-200 dark:border-gray-800 text-gray-500 dark:text-gray-400"
+                  >
+                    <ArrowLeft className="w-4 h-4" />
+                  </button>
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                    <h2 className="text-2xl font-black text-gray-900 dark:text-white uppercase tracking-tight">Scans</h2>
+                    
+                    {/* Timeframe & Date selectors */}
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-xl px-2.5 py-1.5 shadow-sm text-[10px] font-black text-gray-500 dark:text-gray-400">
+                        <Calendar className="w-3.5 h-3.5 text-primary-500" />
+                        <input 
+                          type="date" 
+                          value={analyticsStartDate} 
+                          onChange={(e) => setAnalyticsStartDate(e.target.value)} 
+                          className="bg-transparent border-none outline-none text-slate-800 dark:text-slate-100 focus:ring-0 w-24 uppercase"
+                        />
+                        <span className="text-gray-300 dark:text-gray-700">to</span>
+                        <input 
+                          type="date" 
+                          value={analyticsEndDate} 
+                          onChange={(e) => setAnalyticsEndDate(e.target.value)} 
+                          className="bg-transparent border-none outline-none text-slate-800 dark:text-slate-100 focus:ring-0 w-24 uppercase"
+                        />
+                      </div>
+                      
+                      <select
+                        value={analyticsInterval}
+                        onChange={(e) => setAnalyticsInterval(e.target.value as any)}
+                        className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-xl px-2.5 py-1.5 shadow-sm text-[10px] font-black text-slate-800 dark:text-slate-100 focus:ring-0 outline-none cursor-pointer uppercase tracking-wider"
+                      >
+                        <option value="Hour">Hour</option>
+                        <option value="Day">Day</option>
+                        <option value="Week">Week</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Reset & Download Buttons */}
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={async () => {
+                      if (window.confirm('Are you sure you want to reset scan analytics? This will clear all scan history.')) {
+                        try {
+                          const { error } = await supabase.from('vaults').update({ views: 0 }).eq('id', selectedAnalyticsVault.id);
+                          if (error) throw error;
+                          setVaults(prev => prev.map(v => v.id === selectedAnalyticsVault.id ? { ...v, views: 0 } : v));
+                          setSelectedAnalyticsVault(prev => prev ? { ...prev, views: 0 } : null);
+                          setAnalyticsRawLogs([]);
+                          toast.success('Scan analytics reset successfully.');
+                        } catch (err) {
+                          console.error('Failed to reset scans:', err);
+                          toast.error('Failed to reset scan analytics.');
+                        }
+                      }
+                    }}
+                    className="flex items-center gap-1.5 px-4 py-2 border border-gray-200 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full text-[10px] font-black uppercase tracking-wider text-slate-700 dark:text-slate-300 transition-colors shadow-sm bg-white dark:bg-gray-900"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" /> Reset Scans
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (analyticsLogs.length === 0) {
+                        toast.error('No scan data available to download.');
+                        return;
+                      }
+                      const headers = ['Date', 'Time', 'IP Address', 'Operating System', 'Country', 'City', 'Type'];
+                      const rows = analyticsLogs.map(log => [
+                        log.timestamp.toLocaleDateString(),
+                        log.timestamp.toLocaleTimeString(),
+                        log.ip,
+                        log.os,
+                        log.country,
+                        log.city,
+                        log.unique ? 'Unique' : 'Non-Unique'
+                      ]);
+                      const csvContent = "data:text/csv;charset=utf-8," 
+                        + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+                      const encodedUri = encodeURI(csvContent);
+                      const link = document.createElement("a");
+                      link.setAttribute("href", encodedUri);
+                      link.setAttribute("download", `${selectedAnalyticsVault.name}_scans.csv`);
+                      document.body.appendChild(link);
+                      link.click();
+                      document.body.removeChild(link);
+                      toast.success('CSV downloaded successfully.');
+                    }}
+                    className="flex items-center gap-1.5 px-4 py-2 border border-gray-200 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-white/5 rounded-full text-[10px] font-black uppercase tracking-wider text-slate-700 dark:text-slate-300 transition-colors shadow-sm bg-white dark:bg-gray-900"
+                  >
+                    <Download className="w-3.5 h-3.5" /> Download CSV
+                  </button>
+                </div>
+              </div>
+
+              {/* Main Analytics Content Panels */}
+              <div className="p-6 space-y-6 flex-1 overflow-y-auto">
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                  
+                  {/* OVER TIME Graph panel */}
+                  <div className="lg:col-span-7 bg-white dark:bg-[#0c0d12] border border-gray-100 dark:border-white/5 rounded-3xl p-6 shadow-sm flex flex-col min-h-[350px]">
+                    <div className="flex items-center justify-between mb-6">
+                      <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest">Over Time</h3>
+                      <div className="flex items-center gap-4">
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-2.5 h-2.5 rounded-full bg-cyan-400" />
+                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Non-Unique</span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-2.5 h-2.5 rounded-full bg-blue-600" />
+                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Unique</span>
+                        </div>
+                      </div>
+                    </div>
+                    
+                    <div className="flex-1 w-full min-h-[260px] relative">
+                      {analyticsLogs.length === 0 ? (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center">
+                          <TrendingUp className="w-12 h-12 text-slate-200 dark:text-slate-800 mb-3" />
+                          <span className="text-[10px] font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest italic">0 Scans Recorded</span>
+                        </div>
+                      ) : (
+                        <ResponsiveContainer width="100%" height="100%" minWidth={0}>
+                          <BarChart data={analyticsChartData}>
+                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#88888815" />
+                            <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 9, fontWeight: 900, fill: '#888' }} />
+                            <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 9, fontWeight: 900, fill: '#888' }} />
+                            <Tooltip
+                              cursor={{ fill: '#88888811' }}
+                              contentStyle={{ backgroundColor: '#000', border: 'none', borderRadius: '12px' }}
+                              itemStyle={{ color: '#fff', fontSize: '12px' }}
+                            />
+                            <Bar dataKey="Unique" fill="#2563eb" radius={[4, 4, 0, 0]} />
+                            <Bar dataKey="Non-Unique" fill="#22d3ee" radius={[4, 4, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* OPERATING SYSTEM breakdown panel */}
+                  <div className="lg:col-span-5 bg-white dark:bg-[#0c0d12] border border-gray-100 dark:border-white/5 rounded-3xl p-6 shadow-sm flex flex-col min-h-[350px]">
+                    <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Operating System</h3>
+                    
+                    <div className="flex-1 space-y-4">
+                      {/* List Headers */}
+                      <div className="grid grid-cols-12 text-[9px] font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest pb-2 border-b border-gray-50 dark:border-white/5">
+                        <span className="col-span-4">OS</span>
+                        <span className="col-span-6 text-center">Scans</span>
+                        <span className="col-span-2 text-end">%</span>
+                      </div>
+
+                      {analyticsLogs.length === 0 ? (
+                        <div className="h-full flex items-center justify-center py-12">
+                          <span className="text-[10px] font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest italic">No OS data</span>
+                        </div>
+                      ) : (
+                        analyticsOsStats.map((item, idx) => (
+                          <div key={item.name} className="grid grid-cols-12 items-center text-xs font-black text-slate-700 dark:text-slate-300">
+                            <span className="col-span-4 font-bold">{item.name}</span>
+                            <div className="col-span-6 flex items-center gap-3">
+                              <div className="flex-1 bg-gray-100 dark:bg-gray-800 h-2 rounded-full overflow-hidden">
+                                <div className="h-full bg-rose-400 dark:bg-rose-500/80 rounded-full" style={{ width: `${item.pct}%` }} />
+                              </div>
+                              <span className="tabular-nums">{item.scans}</span>
+                            </div>
+                            <span className="col-span-2 text-end font-black text-slate-900 dark:text-white">{item.pct}%</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  
+                  {/* TOP COUNTRIES panel */}
+                  <div className="bg-white dark:bg-[#0c0d12] border border-gray-100 dark:border-white/5 rounded-3xl p-6 shadow-sm flex flex-col min-h-[250px]">
+                    <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Top Countries</h3>
+                    
+                    <div className="space-y-4">
+                      {/* List Headers */}
+                      <div className="grid grid-cols-12 text-[9px] font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest pb-2 border-b border-gray-50 dark:border-white/5">
+                        <span className="col-span-1">#</span>
+                        <span className="col-span-5">Country</span>
+                        <span className="col-span-3 text-center">Scans</span>
+                        <span className="col-span-3 text-end">%</span>
+                      </div>
+
+                      {analyticsLogs.length === 0 ? (
+                        <div className="flex items-center justify-center py-8">
+                          <span className="text-[10px] font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest italic">No Country data</span>
+                        </div>
+                      ) : (
+                        analyticsCountryStats.slice(0, 5).map((item, idx) => (
+                          <div key={item.name} className="grid grid-cols-12 items-center text-xs font-black text-slate-700 dark:text-slate-300">
+                            <span className="col-span-1 text-slate-400 dark:text-slate-600">#{idx + 1}</span>
+                            <span className="col-span-5 font-bold">{item.name}</span>
+                            <span className="col-span-3 text-center tabular-nums">{item.scans}</span>
+                            <span className="col-span-3 text-end font-black text-slate-900 dark:text-white">{item.pct}%</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  {/* TOP CITIES panel */}
+                  <div className="bg-white dark:bg-[#0c0d12] border border-gray-100 dark:border-white/5 rounded-3xl p-6 shadow-sm flex flex-col min-h-[250px]">
+                    <h3 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-6">Top Cities</h3>
+                    
+                    <div className="space-y-4">
+                      {/* List Headers */}
+                      <div className="grid grid-cols-12 text-[9px] font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest pb-2 border-b border-gray-50 dark:border-white/5">
+                        <span className="col-span-1">#</span>
+                        <span className="col-span-5">City</span>
+                        <span className="col-span-3 text-center">Scans</span>
+                        <span className="col-span-3 text-end">%</span>
+                      </div>
+
+                      {analyticsLogs.length === 0 ? (
+                        <div className="flex items-center justify-center py-8">
+                          <span className="text-[10px] font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest italic">No City data</span>
+                        </div>
+                      ) : (
+                        analyticsCityStats.slice(0, 5).map((item, idx) => (
+                          <div key={item.name} className="grid grid-cols-12 items-center text-xs font-black text-slate-700 dark:text-slate-300">
+                            <span className="col-span-1 text-slate-400 dark:text-slate-600">#{idx + 1}</span>
+                            <span className="col-span-5 font-bold">{item.name}</span>
+                            <span className="col-span-3 text-center tabular-nums">{item.scans}</span>
+                            <span className="col-span-3 text-end font-black text-slate-900 dark:text-white">{item.pct}%</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                </div>
+              </div>
+
+              {/* Modal footer Close control */}
+              <div className="p-6 border-t border-gray-100 dark:border-white/5 bg-gray-50/50 dark:bg-white/[0.02] flex items-center justify-between">
+                <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">Mazeway Scan Telemetry Protocol Active</p>
+                <button
+                  onClick={() => setSelectedAnalyticsVault(null)}
+                  className="px-6 py-2.5 bg-gray-900 dark:bg-white hover:bg-gray-800 dark:hover:bg-gray-100 text-white dark:text-gray-900 text-xs font-black uppercase tracking-[0.2em] rounded-xl transition-all shadow-md active:scale-95"
+                >
+                  Close Scans
+                </button>
+              </div>
+
+            </div>
+          </div>
+        )}
+
+        {/* Submissions Modal */}
+        {submittingVault && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-xl z-[60] flex items-center justify-center p-4 sm:p-8 animate-in fade-in duration-300">
+            <div className="bg-white dark:bg-[#0a0a0b] w-full max-w-4xl max-h-[90vh] rounded-[2.5rem] shadow-2xl overflow-hidden border border-gray-100 dark:border-gray-800 flex flex-col animate-in zoom-in-95 duration-500">
+              <div className="p-8 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between bg-white/50 dark:bg-black/20 backdrop-blur-md">
+                <div>
+                  <h2 className="text-2xl font-black text-gray-900 dark:text-white uppercase tracking-tight">Submission Console</h2>
+                  <p className="text-xs text-gray-400 font-black uppercase tracking-[0.3em] mt-1">{submittingVault.name}</p>
+                </div>
+                <button 
+                  onClick={() => setSubmittingVault(null)}
+                  className="p-3 bg-gray-100 dark:bg-gray-800 text-gray-500 hover:text-red-500 rounded-2xl transition-all active:scale-90"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto p-4 sm:p-8 no-scrollbar">
+                <SubmissionManager vault={submittingVault} />
+              </div>
+              
+              <div className="p-6 bg-gray-50 dark:bg-black/40 border-t border-gray-100 dark:border-gray-800 text-center">
+                 <p className="text-xs text-gray-400 font-bold uppercase tracking-widest">Quantum Hub Encryption Protocol v4.0 Active</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Custom Mode Switch Confirmation Modal */}
+        {pendingModeSwitch && (
+          <div className="fixed inset-0 bg-black/60 dark:bg-black/90 backdrop-blur-sm z-[200] flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div className="bg-white dark:bg-gray-900 rounded-[2.5rem] border border-gray-100 dark:border-white/10 p-8 max-w-md w-full shadow-2xl space-y-6 text-center animate-in zoom-in-95 duration-300">
+              <div className="w-16 h-16 bg-amber-50 dark:bg-amber-950/30 text-amber-500 rounded-full flex items-center justify-center mx-auto shadow-inner border border-amber-100 dark:border-amber-900/20">
+                <AlertTriangle className="w-8 h-8" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-xl font-extrabold text-gray-900 dark:text-white tracking-tight">Switch Vault Mode?</h3>
+                <p className="text-sm text-gray-500 dark:text-gray-400 leading-relaxed">
+                  Are you sure you want to switch to{' '}
+                  <span className="font-black text-primary-600 dark:text-primary-400 uppercase">
+                    {pendingModeSwitch === VaultType.RECEIVING ? 'Collective Mode' : 'Sharing Mode'}
+                  </span>
+                  ?
+                </p>
+                <p className="text-xs text-red-500 dark:text-red-400 font-bold bg-red-50 dark:bg-red-950/20 py-2 px-3 rounded-xl border border-red-100 dark:border-red-900/20">
+                  This will cancel the creation of the current mode vault and reset your configuration, files, and links.
+                </p>
+              </div>
+              
+              <div className="flex gap-3">
+                <button
+                  onClick={() => {
+                    const targetMode = pendingModeSwitch;
+                    if (targetMode) {
+                      handleModeConfirm(targetMode);
+                    }
+                    setPendingModeSwitch(null);
+                  }}
+                  className="flex-1 bg-red-600 hover:bg-red-700 text-white py-3 px-4 rounded-xl font-bold transition-all text-xs uppercase tracking-widest active:scale-95 shadow-md shadow-red-200 dark:shadow-none"
+                >
+                  Yes, Switch Mode
+                </button>
+                <button
+                  onClick={() => setPendingModeSwitch(null)}
+                  className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 py-3 px-4 rounded-xl font-bold transition-all text-xs uppercase tracking-widest active:scale-95 border border-gray-200/50 dark:border-white/5"
+                >
+                  No, Keep Current
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+  );
+};

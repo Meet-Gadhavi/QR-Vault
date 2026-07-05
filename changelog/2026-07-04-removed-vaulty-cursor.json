@@ -1,0 +1,7 @@
+{
+  "title": "Removed Vaulty cursor badge for cleaner branding",
+  "date": "2026-07-04",
+  "description": "Based on user feedback, the interactive cursor-following Vaulty badge has been decommissioned. This creates a much cleaner, distraction-free environment across the platform.",
+  "type": "Improvement",
+  "tags": ["Branding", "Layout"]
+}
